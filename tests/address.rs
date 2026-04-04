@@ -190,7 +190,7 @@ Use the newest bundle id when generated_at is unavailable.
 EOF
 "#,
     );
-    write_agent_config(repo.path(), "text", &agent, None);
+    write_agent_config_with_workers(repo.path(), "text", &agent, None, 4);
 
     write_review_bundle(
         repo.path(),
@@ -336,6 +336,146 @@ esac
 
     let response = fs::read_to_string(bundle.join("agent/R002.response.txt")).unwrap();
     assert!(response.contains("partial raw output before failure"));
+
+    let spec = fs::read_to_string(bundle.join("specs/R001-First-title.md")).unwrap();
+    assert!(spec.contains("## Source Comment"));
+}
+
+#[test]
+fn address_parallel_workers_preserve_stable_comment_order() {
+    let repo = TestRepo::new("parallel-order");
+    init_repo(repo.path());
+    write_init_template(repo.path());
+
+    let agent = agent_script(
+        repo.path(),
+        r#"prompt=$(cat)
+mkdir -p .anne-test
+case "$prompt" in
+  *"Comment: R001"*)
+    : > .anne-test/r001-started
+    attempts=0
+    while [ ! -f .anne-test/r002-started ]; do
+      attempts=$((attempts + 1))
+      if [ "$attempts" -ge 10 ]; then
+        printf 'R002 never started\n' >&2
+        exit 91
+      fi
+      sleep 0.1
+    done
+    cat <<'EOF'
+# Anne
+
+## Feature: Address first finding
+
+### Problem
+
+The first review finding needs a concrete implementation spec.
+
+### Goals
+
+- Produce a focused spec for the first finding.
+
+### Non-Goals
+
+- Solving unrelated review findings.
+
+## Proposed Approach
+
+Explain the narrow implementation steps needed for the first finding.
+EOF
+    ;;
+  *"Comment: R002"*)
+    : > .anne-test/r002-started
+    cat <<'EOF'
+# Anne
+
+## Feature: Address second finding
+
+### Problem
+
+The second review finding needs a concrete implementation spec.
+
+### Goals
+
+- Produce a focused spec for the second finding.
+
+### Non-Goals
+
+- Solving unrelated review findings.
+
+## Proposed Approach
+
+Explain the narrow implementation steps needed for the second finding.
+EOF
+    ;;
+  *)
+    printf 'unexpected prompt\n' >&2
+    exit 1
+    ;;
+esac
+"#,
+    );
+    write_agent_config(repo.path(), "text", &agent, None);
+
+    write_review_bundle(
+        repo.path(),
+        "2026-04-04T16-00-00Z-parallel",
+        Some("2026-04-04T16:00:00Z"),
+        &[
+            ReviewCommentSpec {
+                id: "R002",
+                path: "src/lib.rs",
+                side: "new",
+                line: 6,
+                severity: "warning",
+                title: "Second title",
+                body: "Second body.",
+                hunk_header: Some("@@ -3,3 +3,4 @@"),
+                patch_file: Some("files/0001-src-lib.rs.patch"),
+            },
+            ReviewCommentSpec {
+                id: "R001",
+                path: "src/lib.rs",
+                side: "new",
+                line: 2,
+                severity: "warning",
+                title: "First title",
+                body: "First body.",
+                hunk_header: Some("@@ -1,1 +1,2 @@"),
+                patch_file: Some("files/0001-src-lib.rs.patch"),
+            },
+        ],
+    );
+
+    let output = anne(repo.path(), &["address"]);
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let bundle = address_bundle_path(repo.path(), &output.stdout);
+    let manifest = fs::read_to_string(bundle.join("manifest.json")).unwrap();
+    assert!(manifest.contains("\"workers\": 4"));
+    assert!(
+        manifest.find("\"comment_id\": \"R001\"").unwrap()
+            < manifest.find("\"comment_id\": \"R002\"").unwrap()
+    );
+
+    let selected_comments = fs::read_to_string(bundle.join("selected_comments.json")).unwrap();
+    assert!(
+        selected_comments.find("\"id\": \"R001\"").unwrap()
+            < selected_comments.find("\"id\": \"R002\"").unwrap()
+    );
+
+    let summary = fs::read_to_string(bundle.join("summary.md")).unwrap();
+    assert!(summary.contains("Specs generated: 2"));
+    assert!(
+        summary.find("## R001 src/lib.rs new:2").unwrap()
+            < summary.find("## R002 src/lib.rs new:6").unwrap()
+    );
 
     let spec = fs::read_to_string(bundle.join("specs/R001-First-title.md")).unwrap();
     assert!(spec.contains("## Source Comment"));
@@ -550,6 +690,16 @@ fn write_review_bundle(
 }
 
 fn write_agent_config(path: &Path, output: &str, agent: &Path, filter: Option<&Path>) {
+    write_agent_config_with_workers(path, output, agent, filter, 4);
+}
+
+fn write_agent_config_with_workers(
+    path: &Path,
+    output: &str,
+    agent: &Path,
+    filter: Option<&Path>,
+    workers: usize,
+) {
     let mut text = String::new();
     text.push_str("[agent]\n");
     text.push_str("label = \"test-agent\"\n");
@@ -561,6 +711,7 @@ fn write_agent_config(path: &Path, output: &str, agent: &Path, filter: Option<&P
     }
     text.push_str(&format!("output = \"{}\"\n", output));
     text.push_str("enable_script_wrapper = false\n");
+    text.push_str(&format!("workers = {}\n", workers));
 
     write_file(&path.join(".anne/config.toml"), &text);
 }

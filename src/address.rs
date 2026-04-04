@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     collections::BTreeMap,
     env, fs,
     path::{Path, PathBuf},
@@ -108,29 +109,59 @@ pub fn run(comment_id: Option<String>) -> Result<RunResult, String> {
     update_counts(&mut manifest);
     write_outputs(&bundle_root, &manifest)?;
 
-    for (index, comment) in selected_comments.iter().enumerate() {
-        let comment_error = {
-            let run = &mut manifest.comments[index];
+    let manifest = RefCell::new(manifest);
+    let queued_jobs = selected_comments
+        .iter()
+        .enumerate()
+        .map(|(comment_index, comment)| CommentJob {
+            comment_index,
+            comment: comment.clone(),
+        })
+        .collect::<Vec<_>>();
+
+    agent::run_bounded(
+        config.agent.workers,
+        queued_jobs,
+        |_, job| {
+            let mut manifest = manifest.borrow_mut();
+            let run = &mut manifest.comments[job.comment_index];
+            run.status = CommentStatus::Running;
+            run.agent_prompt_file = Some(format!("agent/{}.prompt.md", job.comment.id));
+            run.agent_response_file = Some(format!("agent/{}.response.txt", job.comment.id));
+            manifest.status = ManifestStatus::Running;
+            update_counts(&mut manifest);
+            write_outputs(&bundle_root, &manifest)
+        },
+        |_, job| {
             process_comment(
                 &repo_root,
                 &bundle_root,
                 &review_context,
                 &init_structure,
                 &config.agent,
-                comment,
-                run,
+                job,
             )
-            .err()
-        };
+        },
+        |_, result| {
+            let mut manifest = manifest.borrow_mut();
+            let run = &mut manifest.comments[result.comment_index];
+            let comment_id = run.comment_id.clone();
+            run.status = result.status;
+            run.spec_file = result.spec_file;
+            run.agent_stderr = result.agent_stderr;
+            run.error = result.error.clone();
 
-        if let Some(error) = comment_error {
-            manifest.errors.push(format!("{}: {error}", comment.id));
-        }
+            if let Some(error) = result.error {
+                manifest.errors.push(format!("{comment_id}: {error}"));
+            }
 
-        manifest.status = ManifestStatus::Running;
-        update_counts(&mut manifest);
-        write_outputs(&bundle_root, &manifest)?;
-    }
+            manifest.status = ManifestStatus::Running;
+            update_counts(&mut manifest);
+            write_outputs(&bundle_root, &manifest)
+        },
+    )?;
+
+    let mut manifest = manifest.into_inner();
 
     if !selected_comments.is_empty() {
         manifest.status = if manifest.errors.is_empty() {
@@ -288,51 +319,68 @@ fn process_comment(
     review_context: &ReviewContext,
     init_structure: &InitStructure,
     agent_config: &AgentConfig,
-    comment: &SourceComment,
-    run: &mut CommentRun,
-) -> Result<(), String> {
-    let prompt_file = format!("agent/{}.prompt.md", comment.id);
-    let response_file = format!("agent/{}.response.txt", comment.id);
-    run.agent_prompt_file = Some(prompt_file.clone());
-    run.agent_response_file = Some(response_file.clone());
+    job: CommentJob,
+) -> CommentJobResult {
+    let prompt_file = format!("agent/{}.prompt.md", job.comment.id);
+    let response_file = format!("agent/{}.response.txt", job.comment.id);
+    let prompt = build_prompt(review_context, init_structure, &job.comment);
 
-    let prompt = build_prompt(review_context, init_structure, comment);
-    fs::write(bundle_root.join(&prompt_file), &prompt)
-        .map_err(|error| mark_failure(run, format!("failed writing {prompt_file}: {error}")))?;
+    if let Err(error) = fs::write(bundle_root.join(&prompt_file), &prompt) {
+        return CommentJobResult::failure(
+            job.comment_index,
+            Vec::new(),
+            format!("failed writing {prompt_file}: {error}"),
+        );
+    }
 
     match agent::run_captured(repo_root, agent_config, &prompt) {
         Ok(result) => {
-            run.agent_stderr = result.stderr_lines.clone();
-            fs::write(bundle_root.join(&response_file), &result.raw_stdout).map_err(|error| {
-                mark_failure(run, format!("failed writing {response_file}: {error}"))
-            })?;
+            if let Err(error) = fs::write(bundle_root.join(&response_file), &result.raw_stdout) {
+                return CommentJobResult::failure(
+                    job.comment_index,
+                    result.stderr_lines,
+                    format!("failed writing {response_file}: {error}"),
+                );
+            }
 
-            let spec_text = finalize_spec(review_context, comment, &result.assistant_text)
-                .map_err(|error| mark_failure(run, error))?;
-            let spec_file = build_spec_file(comment);
-            fs::write(bundle_root.join(&spec_file), spec_text).map_err(|error| {
-                mark_failure(run, format!("failed writing {spec_file}: {error}"))
-            })?;
+            let spec_text =
+                match finalize_spec(review_context, &job.comment, &result.assistant_text) {
+                    Ok(spec_text) => spec_text,
+                    Err(error) => {
+                        return CommentJobResult::failure(
+                            job.comment_index,
+                            result.stderr_lines,
+                            error,
+                        );
+                    }
+                };
 
-            run.status = CommentStatus::Generated;
-            run.spec_file = Some(spec_file);
-            run.error = None;
-            Ok(())
+            let spec_file = build_spec_file(&job.comment);
+            if let Err(error) = fs::write(bundle_root.join(&spec_file), spec_text) {
+                return CommentJobResult::failure(
+                    job.comment_index,
+                    result.stderr_lines,
+                    format!("failed writing {spec_file}: {error}"),
+                );
+            }
+
+            CommentJobResult {
+                comment_index: job.comment_index,
+                status: CommentStatus::Generated,
+                spec_file: Some(spec_file),
+                agent_stderr: result.stderr_lines,
+                error: None,
+            }
         }
         Err(error) => {
-            run.agent_stderr = error.stderr_lines.clone();
-            fs::write(bundle_root.join(&response_file), &error.raw_stdout).map_err(
-                |write_error| {
-                    mark_failure(
-                        run,
-                        format!(
-                            "{}; failed writing {response_file}: {write_error}",
-                            error.message
-                        ),
-                    )
-                },
-            )?;
-            Err(mark_failure(run, error.message))
+            let message = match fs::write(bundle_root.join(&response_file), &error.raw_stdout) {
+                Ok(()) => error.message,
+                Err(write_error) => format!(
+                    "{}; failed writing {response_file}: {write_error}",
+                    error.message
+                ),
+            };
+            CommentJobResult::failure(job.comment_index, error.stderr_lines, message)
         }
     }
 }
@@ -538,12 +586,6 @@ fn build_spec_file(comment: &SourceComment) -> String {
     format!("specs/{}-{}.md", comment.id, slug)
 }
 
-fn mark_failure(run: &mut CommentRun, error: String) -> String {
-    run.status = CommentStatus::Failed;
-    run.error = Some(error.clone());
-    error
-}
-
 fn write_outputs(bundle_root: &Path, manifest: &Manifest) -> Result<(), String> {
     fs::write(
         bundle_root.join("manifest.json"),
@@ -646,6 +688,33 @@ fn to_run_result(manifest: &Manifest) -> RunResult {
         specs_failed: manifest.counts.specs_failed,
         success: manifest.status == ManifestStatus::Succeeded,
         error: manifest.errors.first().cloned(),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CommentJob {
+    comment_index: usize,
+    comment: SourceComment,
+}
+
+#[derive(Debug, Clone)]
+struct CommentJobResult {
+    comment_index: usize,
+    status: CommentStatus,
+    spec_file: Option<String>,
+    agent_stderr: Vec<String>,
+    error: Option<String>,
+}
+
+impl CommentJobResult {
+    fn failure(comment_index: usize, agent_stderr: Vec<String>, error: String) -> Self {
+        Self {
+            comment_index,
+            status: CommentStatus::Failed,
+            spec_file: None,
+            agent_stderr,
+            error: Some(error),
+        }
     }
 }
 
@@ -869,6 +938,7 @@ impl ManifestStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CommentStatus {
     Queued,
+    Running,
     Generated,
     Failed,
 }
@@ -877,6 +947,7 @@ impl CommentStatus {
     fn as_str(self) -> &'static str {
         match self {
             CommentStatus::Queued => "queued",
+            CommentStatus::Running => "running",
             CommentStatus::Generated => "generated",
             CommentStatus::Failed => "failed",
         }
@@ -1024,6 +1095,7 @@ impl RuntimeManifest {
             "progress_filter".to_string(),
             string_array(&self.agent.progress_filter),
         );
+        agent.insert("workers".to_string(), JsonValue::number(self.agent.workers));
 
         let mut object = BTreeMap::new();
         object.insert("agent".to_string(), JsonValue::Object(agent));

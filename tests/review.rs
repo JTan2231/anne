@@ -208,6 +208,254 @@ fn review_uses_progress_filter_and_fails_on_invalid_anchor() {
 }
 
 #[test]
+fn review_parallel_workers_preserve_stable_output_order() {
+    let repo = TestRepo::new("parallel-order");
+    init_repo(repo.path());
+
+    write_file(
+        &repo.path().join("src/a.rs"),
+        "pub fn alpha() -> i32 {\n    1\n}\n",
+    );
+    write_file(
+        &repo.path().join("src/b.rs"),
+        "pub fn beta() -> i32 {\n    1\n}\n",
+    );
+    commit_all(repo.path(), "initial");
+
+    create_and_checkout_branch(repo.path(), "feature");
+    write_file(
+        &repo.path().join("src/a.rs"),
+        "pub fn alpha() -> i32 {\n    2\n}\n",
+    );
+    write_file(
+        &repo.path().join("src/b.rs"),
+        "pub fn beta() -> i32 {\n    2\n}\n",
+    );
+    commit_all(repo.path(), "feature changes");
+
+    checkout_branch(repo.path(), "main");
+
+    let agent = agent_script(
+        repo.path(),
+        r#"prompt=$(cat)
+mkdir -p .anne-test
+case "$prompt" in
+  *"Path: src/a.rs"*)
+    : > .anne-test/a-started
+    attempts=0
+    while [ ! -f .anne-test/b-started ]; do
+      attempts=$((attempts + 1))
+      if [ "$attempts" -ge 10 ]; then
+        printf 'b never started\n' >&2
+        exit 91
+      fi
+      sleep 0.1
+    done
+    printf '[{"path":"src/a.rs","side":"new","line":2,"severity":"warning","title":"A finding","body":"A body."}]\n'
+    ;;
+  *"Path: src/b.rs"*)
+    : > .anne-test/b-started
+    printf '[{"path":"src/b.rs","side":"new","line":2,"severity":"warning","title":"B finding","body":"B body."}]\n'
+    ;;
+  *)
+    printf 'unexpected prompt\n' >&2
+    exit 1
+    ;;
+esac
+"#,
+    );
+    write_agent_config(repo.path(), "text", &agent, None);
+
+    let output = anne(repo.path(), &["review", "main...feature"]);
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let bundle = bundle_path(repo.path(), &output.stdout);
+    let manifest = fs::read_to_string(bundle.join("manifest.json")).unwrap();
+    assert!(manifest.contains("\"workers\": 4"));
+
+    let comments_json = fs::read_to_string(bundle.join("comments.json")).unwrap();
+    assert!(comments_json.contains("\"id\": \"R001\""));
+    assert!(comments_json.contains("\"id\": \"R002\""));
+    assert!(
+        comments_json.find("\"title\": \"A finding\"").unwrap()
+            < comments_json.find("\"title\": \"B finding\"").unwrap()
+    );
+    assert!(
+        comments_json
+            .find("\"patch_file\": \"files/0001-src-a.rs.patch\"")
+            .unwrap()
+            < comments_json
+                .find("\"patch_file\": \"files/0002-src-b.rs.patch\"")
+                .unwrap()
+    );
+
+    let comments_md = fs::read_to_string(bundle.join("comments.md")).unwrap();
+    assert!(
+        comments_md
+            .find("### R001 warning new:2\nA finding")
+            .unwrap()
+            < comments_md
+                .find("### R002 warning new:2\nB finding")
+                .unwrap()
+    );
+}
+
+#[test]
+fn review_preserves_partial_results_when_one_parallel_file_fails() {
+    let repo = TestRepo::new("parallel-partial-failure");
+    init_repo(repo.path());
+
+    write_file(
+        &repo.path().join("src/a.rs"),
+        "pub fn alpha() -> i32 {\n    1\n}\n",
+    );
+    write_file(
+        &repo.path().join("src/b.rs"),
+        "pub fn beta() -> i32 {\n    1\n}\n",
+    );
+    commit_all(repo.path(), "initial");
+
+    create_and_checkout_branch(repo.path(), "feature");
+    write_file(
+        &repo.path().join("src/a.rs"),
+        "pub fn alpha() -> i32 {\n    2\n}\n",
+    );
+    write_file(
+        &repo.path().join("src/b.rs"),
+        "pub fn beta() -> i32 {\n    2\n}\n",
+    );
+    commit_all(repo.path(), "feature changes");
+
+    checkout_branch(repo.path(), "main");
+
+    let agent = agent_script(
+        repo.path(),
+        r#"prompt=$(cat)
+case "$prompt" in
+  *"Path: src/a.rs"*)
+    printf '[{"path":"src/a.rs","side":"new","line":2,"severity":"warning","title":"A finding","body":"A body."}]\n'
+    ;;
+  *"Path: src/b.rs"*)
+    printf 'partial raw output before failure\n'
+    printf 'agent failed intentionally\n' >&2
+    exit 9
+    ;;
+  *)
+    printf 'unexpected prompt\n' >&2
+    exit 1
+    ;;
+esac
+"#,
+    );
+    write_agent_config(repo.path(), "text", &agent, None);
+
+    let output = anne(repo.path(), &["review", "main...feature"]);
+    assert!(
+        !output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let bundle = bundle_path(repo.path(), &output.stdout);
+    let manifest = fs::read_to_string(bundle.join("manifest.json")).unwrap();
+    assert!(manifest.contains("\"status\": \"failed\""));
+    assert!(manifest.contains("\"files_failed\": 1"));
+    assert!(manifest.contains("\"findings\": 1"));
+
+    let comments_json = fs::read_to_string(bundle.join("comments.json")).unwrap();
+    assert!(comments_json.contains("\"path\": \"src/a.rs\""));
+    assert!(!comments_json.contains("\"path\": \"src/b.rs\""));
+
+    let failed_response =
+        fs::read_to_string(bundle.join("agent/0002-src-b.rs.response.txt")).unwrap();
+    assert!(failed_response.contains("partial raw output before failure"));
+
+    let comments_md = fs::read_to_string(bundle.join("comments.md")).unwrap();
+    assert!(comments_md.contains("### R001 warning new:2"));
+    assert!(comments_md.contains("src/b.rs"));
+    assert!(comments_md.contains("Review failed."));
+}
+
+#[test]
+fn review_workers_one_disables_parallel_fan_out() {
+    let repo = TestRepo::new("workers-one");
+    init_repo(repo.path());
+
+    write_file(
+        &repo.path().join("src/a.rs"),
+        "pub fn alpha() -> i32 {\n    1\n}\n",
+    );
+    write_file(
+        &repo.path().join("src/b.rs"),
+        "pub fn beta() -> i32 {\n    1\n}\n",
+    );
+    commit_all(repo.path(), "initial");
+
+    create_and_checkout_branch(repo.path(), "feature");
+    write_file(
+        &repo.path().join("src/a.rs"),
+        "pub fn alpha() -> i32 {\n    2\n}\n",
+    );
+    write_file(
+        &repo.path().join("src/b.rs"),
+        "pub fn beta() -> i32 {\n    2\n}\n",
+    );
+    commit_all(repo.path(), "feature changes");
+
+    checkout_branch(repo.path(), "main");
+
+    let agent = agent_script(
+        repo.path(),
+        r#"prompt=$(cat)
+mkdir -p .anne-test
+case "$prompt" in
+  *"Path: src/a.rs"*)
+    attempts=0
+    while [ ! -f .anne-test/b-started ]; do
+      attempts=$((attempts + 1))
+      if [ "$attempts" -ge 10 ]; then
+        printf 'b never started\n' >&2
+        exit 91
+      fi
+      sleep 0.1
+    done
+    printf '[{"path":"src/a.rs","side":"new","line":2,"severity":"warning","title":"A finding","body":"A body."}]\n'
+    ;;
+  *"Path: src/b.rs"*)
+    : > .anne-test/b-started
+    printf '[{"path":"src/b.rs","side":"new","line":2,"severity":"warning","title":"B finding","body":"B body."}]\n'
+    ;;
+  *)
+    printf 'unexpected prompt\n' >&2
+    exit 1
+    ;;
+esac
+"#,
+    );
+    write_agent_config_with_workers(repo.path(), "text", &agent, None, 1);
+
+    let output = anne(repo.path(), &["review", "main...feature"]);
+    assert!(
+        !output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let bundle = bundle_path(repo.path(), &output.stdout);
+    let manifest = fs::read_to_string(bundle.join("manifest.json")).unwrap();
+    assert!(manifest.contains("\"workers\": 1"));
+    assert!(manifest.contains("b never started"));
+    assert!(manifest.contains("\"status\": \"failed\""));
+}
+
+#[test]
 fn review_skips_pure_renames_from_git2_diff_data() {
     let repo = TestRepo::new("rename-only");
     init_repo(repo.path());
@@ -329,6 +577,16 @@ fn checkout_branch(path: &Path, name: &str) {
 }
 
 fn write_agent_config(path: &Path, output: &str, agent: &Path, filter: Option<&Path>) {
+    write_agent_config_with_workers(path, output, agent, filter, 4);
+}
+
+fn write_agent_config_with_workers(
+    path: &Path,
+    output: &str,
+    agent: &Path,
+    filter: Option<&Path>,
+    workers: usize,
+) {
     let mut text = String::new();
     text.push_str("[agent]\n");
     text.push_str("label = \"test-agent\"\n");
@@ -340,6 +598,7 @@ fn write_agent_config(path: &Path, output: &str, agent: &Path, filter: Option<&P
     }
     text.push_str(&format!("output = \"{}\"\n", output));
     text.push_str("enable_script_wrapper = false\n\n");
+    text.push_str(&format!("workers = {}\n\n", workers));
     text.push_str("[review]\n");
     text.push_str("max_patch_bytes = 4096\n");
     text.push_str("ignore_prefixes = [\"vendor/\"]\n");

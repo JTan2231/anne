@@ -35,6 +35,7 @@ pub struct AgentConfig {
     pub progress_filter: Vec<String>,
     pub output: AgentOutput,
     pub enable_script_wrapper: bool,
+    pub workers: usize,
 }
 
 impl Default for AgentConfig {
@@ -45,6 +46,7 @@ impl Default for AgentConfig {
             progress_filter: Vec::new(),
             output: AgentOutput::default(),
             enable_script_wrapper: false,
+            workers: 4,
         }
     }
 }
@@ -160,6 +162,9 @@ fn parse_config(text: &str) -> Result<AppConfig, String> {
             ("agent", "enable_script_wrapper") => {
                 config.agent.enable_script_wrapper = parse_bool(value)?
             }
+            ("agent", "workers") => {
+                config.agent.workers = parse_worker_count(value)?;
+            }
             ("review", "max_patch_bytes") => config.review.max_patch_bytes = parse_usize(value)?,
             ("review", "ignore_prefixes") => {
                 config.review.ignore_prefixes = parse_string_array(value)?
@@ -214,6 +219,14 @@ fn parse_usize(value: &str) -> Result<usize, String> {
         .trim()
         .parse::<usize>()
         .map_err(|error| format!("expected integer, got `{value}`: {error}"))
+}
+
+fn parse_worker_count(value: &str) -> Result<usize, String> {
+    let workers = parse_usize(value)?;
+    if workers == 0 {
+        return Err("agent.workers must be greater than 0".to_string());
+    }
+    Ok(workers)
 }
 
 fn normalized_agent_label(label: &str) -> String {
@@ -303,8 +316,35 @@ ignore_prefixes = ["vendor/", "dist/"]
         assert_eq!(config.agent.command, vec!["./agent.sh"]);
         assert_eq!(config.agent.progress_filter, vec!["./filter.sh"]);
         assert_eq!(config.agent.output, AgentOutput::WrappedJson);
+        assert_eq!(config.agent.workers, 4);
         assert_eq!(config.review.max_patch_bytes, 4096);
         assert_eq!(config.review.ignore_prefixes, vec!["vendor/", "dist/"]);
+    }
+
+    #[test]
+    fn parses_explicit_worker_count() {
+        let config = parse_config(
+            r#"
+[agent]
+workers = 1
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.agent.workers, 1);
+    }
+
+    #[test]
+    fn rejects_zero_workers() {
+        let error = parse_config(
+            r#"
+[agent]
+workers = 0
+"#,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("agent.workers must be greater than 0"));
     }
 
     #[test]
@@ -324,6 +364,7 @@ ignore_prefixes = ["vendor/", "dist/"]
 
         assert_eq!(config.agent.label, "default");
         assert_eq!(config.agent.output, AgentOutput::WrappedJson);
+        assert_eq!(config.agent.workers, 4);
         assert_eq!(config.agent.command.len(), 1);
         assert_eq!(config.agent.progress_filter.len(), 1);
         assert_eq!(

@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, BTreeSet},
     env, fs,
     path::{Path, PathBuf},
@@ -95,9 +96,8 @@ pub fn run(request: ReviewRequest) -> Result<RunResult, String> {
         errors: Vec::new(),
     };
     update_counts(&mut manifest);
-    write_outputs(&bundle_root, &manifest, &[])?;
+    write_manifest(&bundle_root, &manifest)?;
 
-    let mut findings = Vec::new();
     if files.iter().any(|file| file.status == FileStatus::Queued) && config.agent.command.is_empty()
     {
         let error =
@@ -118,58 +118,77 @@ pub fn run(request: ReviewRequest) -> Result<RunResult, String> {
         return Ok(to_run_result(&manifest, Some(error)));
     }
 
-    let queued_indices = files
+    let files = RefCell::new(files);
+    let manifest = RefCell::new(manifest);
+    let findings = RefCell::new(Vec::new());
+
+    let queued_jobs = files
+        .borrow()
         .iter()
         .enumerate()
-        .filter_map(|(index, file)| (file.status == FileStatus::Queued).then_some(index))
+        .filter(|(_, file)| file.status == FileStatus::Queued)
+        .map(|(file_index, file)| ReviewJob {
+            file_index,
+            file: file.clone(),
+        })
         .collect::<Vec<_>>();
 
-    for index in queued_indices {
-        let file_error = {
-            let file = &mut files[index];
+    agent::run_bounded(
+        config.agent.workers,
+        queued_jobs,
+        |_, job| {
+            let mut files = files.borrow_mut();
+            let mut manifest = manifest.borrow_mut();
+            let file = &mut files[job.file_index];
             let (prompt_file, response_file) = agent_artifact_paths(file);
-            let prompt = build_prompt(&request.base, &request.head, &review_range.merge_base, file);
-
-            fs::write(bundle_root.join(&prompt_file), &prompt)
-                .map_err(|error| format!("failed writing {prompt_file}: {error}"))?;
+            file.status = FileStatus::Running;
             file.agent_prompt_file = Some(prompt_file);
-            file.agent_response_file = Some(response_file.clone());
-
-            match review_file(
+            file.agent_response_file = Some(response_file);
+            sync_manifest_files(&mut manifest, &files);
+            manifest.status = ManifestStatus::Running;
+            update_counts(&mut manifest);
+            write_manifest(&bundle_root, &manifest)
+        },
+        |_, job| {
+            review_file(
                 &repo_root,
                 &bundle_root,
                 &config.agent,
-                file,
-                &prompt,
-                &response_file,
-            ) {
-                Ok(file_findings) => {
-                    file.status = FileStatus::Reviewed;
-                    file.findings = file_findings.len();
-                    findings.extend(file_findings);
-                    None
-                }
-                Err(error) => {
-                    file.status = FileStatus::Failed;
-                    file.error = Some(error.clone());
-                    Some(format!("{}: {error}", file.display_path))
-                }
+                &request.base,
+                &request.head,
+                &review_range.merge_base,
+                job,
+            )
+        },
+        |_, result| {
+            let mut files = files.borrow_mut();
+            let mut manifest = manifest.borrow_mut();
+            let mut findings = findings.borrow_mut();
+            let file = &mut files[result.file_index];
+            file.agent_stderr = result.agent_stderr;
+            file.findings = result.findings.len();
+            file.error = result.error.clone();
+
+            if let Some(error) = result.error {
+                file.status = FileStatus::Failed;
+                manifest
+                    .errors
+                    .push(format!("{}: {error}", file.display_path));
+            } else {
+                file.status = FileStatus::Reviewed;
+                findings.extend(result.findings);
             }
-        };
 
-        if let Some(error) = file_error {
-            manifest.errors.push(error);
-        }
+            sync_manifest_files(&mut manifest, &files);
+            manifest.status = ManifestStatus::Running;
+            update_counts(&mut manifest);
+            write_manifest(&bundle_root, &manifest)
+        },
+    )?;
 
-        sync_manifest_files(&mut manifest, &files);
-        manifest.status = if manifest.errors.is_empty() {
-            ManifestStatus::Running
-        } else {
-            ManifestStatus::Failed
-        };
-        update_counts(&mut manifest);
-        write_outputs(&bundle_root, &manifest, &findings)?;
-    }
+    let mut files = files.into_inner();
+    let mut manifest = manifest.into_inner();
+    let mut findings = findings.into_inner();
 
     findings.sort_by(|left, right| {
         left.path
@@ -198,17 +217,56 @@ fn review_file(
     repo_root: &Path,
     bundle_root: &Path,
     agent_config: &AgentConfig,
-    file: &mut ReviewFile,
-    prompt: &str,
-    response_file: &str,
-) -> Result<Vec<Finding>, String> {
-    let result = agent::run(repo_root, agent_config, prompt)?;
-    fs::write(bundle_root.join(response_file), &result.raw_stdout)
-        .map_err(|error| format!("failed writing {response_file}: {error}"))?;
-    file.agent_stderr = result.stderr_lines.clone();
+    base: &str,
+    head: &str,
+    merge_base: &str,
+    job: ReviewJob,
+) -> ReviewJobResult {
+    let (prompt_file, response_file) = agent_artifact_paths(&job.file);
+    let prompt = build_prompt(base, head, merge_base, &job.file);
 
-    let raw_findings = parse_agent_findings(&result.assistant_text)?;
-    validate_findings(file, raw_findings)
+    if let Err(error) = fs::write(bundle_root.join(&prompt_file), &prompt) {
+        return ReviewJobResult::failure(
+            job.file_index,
+            Vec::new(),
+            format!("failed writing {prompt_file}: {error}"),
+        );
+    }
+
+    match agent::run_captured(repo_root, agent_config, &prompt) {
+        Ok(result) => {
+            if let Err(error) = fs::write(bundle_root.join(&response_file), &result.raw_stdout) {
+                return ReviewJobResult::failure(
+                    job.file_index,
+                    result.stderr_lines,
+                    format!("failed writing {response_file}: {error}"),
+                );
+            }
+
+            match parse_agent_findings(&result.assistant_text)
+                .and_then(|raw_findings| validate_findings(&job.file, raw_findings))
+            {
+                Ok(findings) => ReviewJobResult {
+                    file_index: job.file_index,
+                    agent_stderr: result.stderr_lines,
+                    findings,
+                    error: None,
+                },
+                Err(error) => ReviewJobResult::failure(job.file_index, result.stderr_lines, error),
+            }
+        }
+        Err(error) => {
+            let message = match fs::write(bundle_root.join(&response_file), &error.raw_stdout) {
+                Ok(()) => error.message,
+                Err(write_error) => format!(
+                    "{}; failed writing {response_file}: {write_error}",
+                    error.message
+                ),
+            };
+
+            ReviewJobResult::failure(job.file_index, error.stderr_lines, message)
+        }
+    }
 }
 
 fn parse_agent_findings(text: &str) -> Result<Vec<RawFinding>, String> {
@@ -586,16 +644,20 @@ fn optional_scalar_string(
     }
 }
 
+fn write_manifest(bundle_root: &Path, manifest: &Manifest) -> Result<(), String> {
+    fs::write(
+        bundle_root.join("manifest.json"),
+        manifest.to_json().render_pretty(),
+    )
+    .map_err(|error| format!("failed writing manifest.json: {error}"))
+}
+
 fn write_outputs(
     bundle_root: &Path,
     manifest: &Manifest,
     findings: &[Finding],
 ) -> Result<(), String> {
-    fs::write(
-        bundle_root.join("manifest.json"),
-        manifest.to_json().render_pretty(),
-    )
-    .map_err(|error| format!("failed writing manifest.json: {error}"))?;
+    write_manifest(bundle_root, manifest)?;
     fs::write(
         bundle_root.join("comments.json"),
         JsonValue::Array(findings.iter().map(Finding::to_json).collect()).render_pretty(),
@@ -675,6 +737,9 @@ fn render_markdown(manifest: &Manifest, findings: &[Finding]) -> String {
                     text.push_str("\n\n");
                 }
             }
+            FileStatus::Running => {
+                text.push_str("Review running.\n\n");
+            }
             FileStatus::Queued | FileStatus::Skipped => {}
         }
     }
@@ -744,6 +809,31 @@ fn to_run_result(manifest: &Manifest, error: Option<String>) -> RunResult {
         findings: manifest.counts.findings,
         success: manifest.status == ManifestStatus::Succeeded,
         error,
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ReviewJob {
+    file_index: usize,
+    file: ReviewFile,
+}
+
+#[derive(Debug, Clone)]
+struct ReviewJobResult {
+    file_index: usize,
+    agent_stderr: Vec<String>,
+    findings: Vec<Finding>,
+    error: Option<String>,
+}
+
+impl ReviewJobResult {
+    fn failure(file_index: usize, agent_stderr: Vec<String>, error: String) -> Self {
+        Self {
+            file_index,
+            agent_stderr,
+            findings: Vec::new(),
+            error: Some(error),
+        }
     }
 }
 
@@ -882,6 +972,7 @@ impl Severity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FileStatus {
     Queued,
+    Running,
     Reviewed,
     Skipped,
     Failed,
@@ -891,6 +982,7 @@ impl FileStatus {
     fn as_str(self) -> &'static str {
         match self {
             FileStatus::Queued => "queued",
+            FileStatus::Running => "running",
             FileStatus::Reviewed => "reviewed",
             FileStatus::Skipped => "skipped",
             FileStatus::Failed => "failed",
@@ -1018,6 +1110,7 @@ impl RuntimeManifest {
             "progress_filter".to_string(),
             string_array(&self.agent.progress_filter),
         );
+        agent.insert("workers".to_string(), JsonValue::number(self.agent.workers));
 
         let mut review = BTreeMap::new();
         review.insert(

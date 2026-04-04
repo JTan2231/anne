@@ -1,8 +1,9 @@
 use std::{
+    collections::VecDeque,
     io::{BufRead, BufReader, Read, Write},
     path::Path,
     process::{Command, Stdio},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, mpsc},
     thread,
 };
 
@@ -22,8 +23,89 @@ pub struct AgentFailure {
     pub stderr_lines: Vec<String>,
 }
 
-pub fn run(repo_root: &Path, config: &AgentConfig, prompt: &str) -> Result<AgentResult, String> {
-    run_captured(repo_root, config, prompt).map_err(|error| error.message)
+pub fn run_bounded<Job, Output, OnStart, Worker, OnResult>(
+    workers: usize,
+    jobs: Vec<Job>,
+    mut on_start: OnStart,
+    worker: Worker,
+    mut on_result: OnResult,
+) -> Result<(), String>
+where
+    Job: Send,
+    Output: Send,
+    OnStart: FnMut(usize, &Job) -> Result<(), String>,
+    Worker: Fn(usize, Job) -> Output + Sync,
+    OnResult: FnMut(usize, Output) -> Result<(), String>,
+{
+    let workers = workers.max(1);
+    let mut pending = jobs.into_iter().enumerate().collect::<VecDeque<_>>();
+    let (sender, receiver) = mpsc::channel::<(usize, Output)>();
+    let mut active = 0usize;
+    let mut error = None;
+
+    thread::scope(|scope| {
+        let mut handles = Vec::new();
+
+        let mut dispatch = |pending: &mut VecDeque<(usize, Job)>,
+                            active: &mut usize,
+                            error: &mut Option<String>| {
+            while error.is_none() && *active < workers {
+                let Some((index, job)) = pending.pop_front() else {
+                    break;
+                };
+                if let Err(dispatch_error) = on_start(index, &job) {
+                    *error = Some(dispatch_error);
+                    pending.clear();
+                    break;
+                }
+
+                *active += 1;
+                let sender = sender.clone();
+                let worker = &worker;
+                handles.push(scope.spawn(move || {
+                    let output = worker(index, job);
+                    let _ = sender.send((index, output));
+                }));
+            }
+        };
+
+        dispatch(&mut pending, &mut active, &mut error);
+
+        while active > 0 {
+            match receiver.recv() {
+                Ok((index, output)) => {
+                    active -= 1;
+                    if error.is_none()
+                        && let Err(result_error) = on_result(index, output)
+                    {
+                        error = Some(result_error);
+                        pending.clear();
+                    }
+
+                    if error.is_none() {
+                        dispatch(&mut pending, &mut active, &mut error);
+                    }
+                }
+                Err(_) => {
+                    if error.is_none() {
+                        error = Some("bounded worker channel closed unexpectedly".to_string());
+                    }
+                    break;
+                }
+            }
+        }
+
+        for handle in handles {
+            if handle.join().is_err() && error.is_none() {
+                error = Some("bounded worker thread panicked".to_string());
+            }
+        }
+    });
+
+    match error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 pub fn run_captured(
