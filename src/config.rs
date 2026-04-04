@@ -1,4 +1,8 @@
-use std::{fs, path::Path};
+use std::{
+    collections::HashSet,
+    env, fs,
+    path::{Path, PathBuf},
+};
 
 #[derive(Debug, Clone, Default)]
 pub struct AppConfig {
@@ -10,13 +14,17 @@ impl AppConfig {
     pub fn load(repo_root: &Path) -> Result<Self, String> {
         let path = repo_root.join(".anne").join("config.toml");
         if !path.exists() {
-            return Ok(Self::default());
+            let mut config = Self::default();
+            config.agent.apply_bundled_defaults();
+            return Ok(config);
         }
 
         let contents = fs::read_to_string(&path)
             .map_err(|error| format!("failed reading {}: {error}", path.display()))?;
-        parse_config(&contents)
-            .map_err(|error| format!("failed parsing {}: {error}", path.display()))
+        let mut config = parse_config(&contents)
+            .map_err(|error| format!("failed parsing {}: {error}", path.display()))?;
+        config.agent.apply_bundled_defaults();
+        Ok(config)
     }
 }
 
@@ -32,7 +40,7 @@ pub struct AgentConfig {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            label: "agent".to_string(),
+            label: "default".to_string(),
             command: Vec::new(),
             progress_filter: Vec::new(),
             output: AgentOutput::default(),
@@ -53,6 +61,32 @@ impl AgentOutput {
         match self {
             AgentOutput::Text => "text",
             AgentOutput::WrappedJson => "wrapped-json",
+        }
+    }
+}
+
+impl AgentConfig {
+    fn apply_bundled_defaults(&mut self) {
+        let label = normalized_agent_label(&self.label);
+        self.label = label.clone();
+
+        if self.command.is_empty()
+            && let Some(path) = bundled_agent_command(&label)
+        {
+            self.command = vec![path.display().to_string()];
+        }
+
+        if self.progress_filter.is_empty()
+            && let Some(path) = bundled_progress_filter(&label)
+        {
+            self.progress_filter = vec![path.display().to_string()];
+        }
+
+        if !self.command.is_empty()
+            && !self.progress_filter.is_empty()
+            && self.output == AgentOutput::Text
+        {
+            self.output = AgentOutput::WrappedJson;
         }
     }
 }
@@ -89,10 +123,7 @@ impl ReviewConfig {
 
 fn parse_config(text: &str) -> Result<AppConfig, String> {
     let mut config = AppConfig {
-        agent: AgentConfig {
-            label: "agent".to_string(),
-            ..AgentConfig::default()
-        },
+        agent: AgentConfig::default(),
         review: ReviewConfig::default(),
     };
     let mut section = String::new();
@@ -185,9 +216,70 @@ fn parse_usize(value: &str) -> Result<usize, String> {
         .map_err(|error| format!("expected integer, got `{value}`: {error}"))
 }
 
+fn normalized_agent_label(label: &str) -> String {
+    let trimmed = label.trim();
+    if trimmed.is_empty() || trimmed == "agent" {
+        "default".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn bundled_agent_shim_dir_candidates() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+
+    if let Ok(dir) = env::var("ANNE_AGENT_SHIMS_DIR") {
+        let trimmed = dir.trim();
+        if !trimmed.is_empty() {
+            dirs.push(PathBuf::from(trimmed));
+        }
+    }
+
+    if let Ok(exe) = env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        dirs.push(dir.join("agents"));
+        if let Some(prefix) = dir.parent() {
+            dirs.push(prefix.join("share").join("anne").join("agents"));
+        }
+    }
+
+    dirs.push(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("examples")
+            .join("agents"),
+    );
+
+    let mut seen = HashSet::new();
+    dirs.retain(|path| path.is_dir() && seen.insert(path.clone()));
+    dirs
+}
+
+fn bundled_agent_command(label: &str) -> Option<PathBuf> {
+    find_in_shim_dirs(&format!("{label}/agent.sh"))
+}
+
+fn bundled_progress_filter(label: &str) -> Option<PathBuf> {
+    find_in_shim_dirs(&format!("{label}/filter.sh"))
+}
+
+fn find_in_shim_dirs(filename: &str) -> Option<PathBuf> {
+    for dir in bundled_agent_shim_dir_candidates() {
+        let candidate = dir.join(filename);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{AgentOutput, parse_config};
+    use super::{AgentOutput, AppConfig, bundled_agent_command, parse_config};
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     #[test]
     fn parses_minimal_config() {
@@ -213,5 +305,35 @@ ignore_prefixes = ["vendor/", "dist/"]
         assert_eq!(config.agent.output, AgentOutput::WrappedJson);
         assert_eq!(config.review.max_patch_bytes, 4096);
         assert_eq!(config.review.ignore_prefixes, vec!["vendor/", "dist/"]);
+    }
+
+    #[test]
+    fn loads_bundled_default_agent_when_config_is_missing() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let repo_root = std::env::temp_dir().join(format!(
+            "anne-config-default-agent-{}-{}",
+            std::process::id(),
+            unique
+        ));
+        fs::create_dir_all(&repo_root).unwrap();
+
+        let config = AppConfig::load(&repo_root).unwrap();
+
+        assert_eq!(config.agent.label, "default");
+        assert_eq!(config.agent.output, AgentOutput::WrappedJson);
+        assert_eq!(config.agent.command.len(), 1);
+        assert_eq!(config.agent.progress_filter.len(), 1);
+        assert_eq!(
+            config.agent.command[0],
+            bundled_agent_command("default")
+                .unwrap()
+                .display()
+                .to_string()
+        );
+
+        let _ = fs::remove_dir_all(repo_root);
     }
 }

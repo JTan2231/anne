@@ -114,6 +114,53 @@ fn review_accepts_plain_agent_findings() {
 }
 
 #[test]
+fn review_uses_bundled_default_agent_shim_when_config_is_missing() {
+    let repo = TestRepo::new("bundled-default");
+    init_repo(repo.path());
+
+    write_file(
+        &repo.path().join("src/lib.rs"),
+        "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n",
+    );
+    commit_all(repo.path(), "initial");
+
+    create_and_checkout_branch(repo.path(), "feature");
+    write_file(
+        &repo.path().join("src/lib.rs"),
+        "pub fn add(a: i32, b: i32) -> i32 {\n    a + b + 1\n}\n",
+    );
+    commit_all(repo.path(), "feature changes");
+
+    checkout_branch(repo.path(), "main");
+
+    let bin_dir = repo.path().join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    codex_script(&bin_dir);
+    jq_script(&bin_dir);
+
+    let path_env = prepend_path(&bin_dir);
+    let output = anne_with_path(repo.path(), &["review", "main...feature"], Some(&path_env));
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let bundle = bundle_path(repo.path(), &output.stdout);
+    let comments_json = fs::read_to_string(bundle.join("comments.json")).unwrap();
+    assert_eq!(comments_json.trim(), "[]");
+
+    let manifest = fs::read_to_string(bundle.join("manifest.json")).unwrap();
+    assert!(manifest.contains("\"label\": \"default\""));
+    assert!(manifest.contains("default/agent.sh"));
+    assert!(manifest.contains("default/filter.sh"));
+
+    let response = fs::read_to_string(bundle.join("agent/0001-src-lib.rs.response.txt")).unwrap();
+    assert!(response.contains("\"agent_message\""));
+}
+
+#[test]
 fn review_uses_progress_filter_and_fails_on_invalid_anchor() {
     let repo = TestRepo::new("filter-failure");
     init_repo(repo.path());
@@ -313,6 +360,100 @@ fn filter_script(path: &Path) -> PathBuf {
         "#!/bin/sh\nset -eu\nwhile IFS= read -r line; do\n  case \"$line\" in\n    FINAL:*) printf '%s\\n' \"${line#FINAL:}\" ;;\n    *) printf '%s\\n' \"$line\" >&2 ;;\n  esac\ndone\n",
     );
     script
+}
+
+fn codex_script(path: &Path) -> PathBuf {
+    let script = path.join("codex");
+    write_executable(
+        &script,
+        "#!/usr/bin/env bash\nset -euo pipefail\n[ \"$1\" = \"exec\" ]\n[ \"$2\" = \"--json\" ]\n[ \"$3\" = \"-\" ]\ncat >/dev/null\nprintf '%s\\n' '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"[]\"}}'\n",
+    );
+    script
+}
+
+fn jq_script(path: &Path) -> PathBuf {
+    let script = path.join("jq");
+    write_executable(
+        &script,
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+[ "$1" = "-r" ]
+expr="$2"
+input=$(cat)
+export ANNE_TEST_JQ_INPUT="$input"
+python3 - "$expr" <<'PY'
+import json
+import os
+import sys
+
+expr = sys.argv[1]
+data = json.loads(os.environ["ANNE_TEST_JQ_INPUT"])
+
+def get_path(*parts):
+    value = data
+    for part in parts:
+        if not isinstance(value, dict) or part not in value:
+            return None
+        value = value[part]
+    return value
+
+def coalesce(*values):
+    for value in values:
+        if value is not None:
+            return value
+    return ""
+
+value = {
+    'try .type // ""': get_path("type"),
+    'try .thread_id // ""': get_path("thread_id"),
+    'try .item.type // ""': get_path("item", "type"),
+    'try .item.text // ""': get_path("item", "text"),
+    'try .item.status // ""': get_path("item", "status"),
+    'try (.item.progress // .progress) // ""': coalesce(
+        get_path("item", "progress"),
+        get_path("progress"),
+    ),
+    'try .item.command // ""': get_path("item", "command"),
+    'try .item.exit_code // ""': get_path("item", "exit_code"),
+    'try (.usage.input_tokens // .usage.prompt_tokens) // ""': coalesce(
+        get_path("usage", "input_tokens"),
+        get_path("usage", "prompt_tokens"),
+    ),
+    'try .usage.cached_input_tokens // ""': get_path("usage", "cached_input_tokens"),
+    'try (.usage.output_tokens // .usage.completion_tokens) // ""': coalesce(
+        get_path("usage", "output_tokens"),
+        get_path("usage", "completion_tokens"),
+    ),
+    'try .usage.reasoning_output_tokens // ""': get_path("usage", "reasoning_output_tokens"),
+    'try (.usage.total_tokens // .usage.total) // ""': coalesce(
+        get_path("usage", "total_tokens"),
+        get_path("usage", "total"),
+    ),
+    'try (.phase // .label) // ""': coalesce(get_path("phase"), get_path("label")),
+    'try .message // ""': get_path("message"),
+    'try .detail // .path // ""': coalesce(get_path("detail"), get_path("path")),
+}.get(expr, "")
+
+if value is None:
+    value = ""
+
+if isinstance(value, bool):
+    print("true" if value else "false")
+else:
+    print(value)
+PY
+"#,
+    );
+    script
+}
+
+fn prepend_path(dir: &Path) -> String {
+    let current = std::env::var("PATH").unwrap_or_default();
+    if current.is_empty() {
+        dir.display().to_string()
+    } else {
+        format!("{}:{}", dir.display(), current)
+    }
 }
 
 fn anne(path: &Path, args: &[&str]) -> Output {
