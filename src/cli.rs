@@ -5,9 +5,15 @@ pub struct ReviewRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddressRequest {
+    pub comment_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     Help(String),
     Review(ReviewRequest),
+    Address(AddressRequest),
 }
 
 pub fn parse(args: &[String]) -> Result<Command, String> {
@@ -18,6 +24,7 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
     match args[0].as_str() {
         "-h" | "--help" | "help" => Ok(Command::Help(root_help())),
         "review" => parse_review(&args[1..]),
+        "address" => parse_address(&args[1..]),
         other => Err(format!("unknown command `{other}`\n\n{}", root_help())),
     }
 }
@@ -100,9 +107,35 @@ fn parse_review(args: &[String]) -> Result<Command, String> {
     }
 }
 
+fn parse_address(args: &[String]) -> Result<Command, String> {
+    if args.is_empty() {
+        return Ok(Command::Address(AddressRequest { comment_id: None }));
+    }
+
+    let mut comment_id = None;
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "-h" | "--help" => return Ok(Command::Help(address_help())),
+            value if value.starts_with("--") => {
+                return Err(format!("unknown flag `{value}`"));
+            }
+            value => {
+                if comment_id.replace(value.to_string()).is_some() {
+                    return Err("address accepts at most one positional <comment-id>".to_string());
+                }
+                index += 1;
+            }
+        }
+    }
+
+    Ok(Command::Address(AddressRequest { comment_id }))
+}
+
 fn root_help() -> String {
     format!(
-        "{binary}\n\nCommands:\n  review   Review <base>...<head> using merge-base semantics\n\nRun `{binary} review --help` for details.",
+        "{binary}\n\nCommands:\n  review    Review <base>...<head> using merge-base semantics\n  address   Generate feature specs from the latest persisted review findings\n\nRun `{binary} review --help` or `{binary} address --help` for details.",
         binary = "anne"
     )
 }
@@ -121,5 +154,22 @@ Notes:
   - Triple-dot review is canonical user-facing syntax.
   - Anne resolves the merge base between `<base>` and `<head>` and reviews the diff from that merge base to `<head>`.
   - Two-dot range math is intentionally not accepted here."
+        .to_string()
+}
+
+fn address_help() -> String {
+    "\
+anne address
+
+Generate one feature spec per selected review comment from the latest persisted review bundle.
+
+Usage:
+  anne address
+  anne address <comment-id>
+
+Notes:
+  - Anne discovers review bundles at runtime under `.anne/reviews/`.
+  - Without a comment id, Anne addresses all comments from the newest review bundle in stable id order.
+  - With a comment id, Anne addresses exactly that comment from the newest review bundle."
         .to_string()
 }

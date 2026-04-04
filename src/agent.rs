@@ -15,18 +15,37 @@ pub struct AgentResult {
     pub stderr_lines: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct AgentFailure {
+    pub message: String,
+    pub raw_stdout: String,
+    pub stderr_lines: Vec<String>,
+}
+
 pub fn run(repo_root: &Path, config: &AgentConfig, prompt: &str) -> Result<AgentResult, String> {
+    run_captured(repo_root, config, prompt).map_err(|error| error.message)
+}
+
+pub fn run_captured(
+    repo_root: &Path,
+    config: &AgentConfig,
+    prompt: &str,
+) -> Result<AgentResult, AgentFailure> {
     if config.command.is_empty() {
-        return Err(
-            "agent.command is not configured; set it in .anne/config.toml before running review"
-                .to_string(),
-        );
+        return Err(AgentFailure {
+            message:
+                "agent.command is not configured; set it in .anne/config.toml before running Anne"
+                    .to_string(),
+            raw_stdout: String::new(),
+            stderr_lines: Vec::new(),
+        });
     }
 
-    let (program, args) = config
-        .command
-        .split_first()
-        .ok_or_else(|| "agent.command is empty".to_string())?;
+    let (program, args) = config.command.split_first().ok_or_else(|| AgentFailure {
+        message: "agent.command is empty".to_string(),
+        raw_stdout: String::new(),
+        stderr_lines: Vec::new(),
+    })?;
 
     let mut child = Command::new(program)
         .args(args)
@@ -35,15 +54,24 @@ pub fn run(repo_root: &Path, config: &AgentConfig, prompt: &str) -> Result<Agent
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|error| format!("failed spawning agent `{program}`: {error}"))?;
+        .map_err(|error| AgentFailure {
+            message: format!("failed spawning agent `{program}`: {error}"),
+            raw_stdout: String::new(),
+            stderr_lines: Vec::new(),
+        })?;
 
     let filter = if config.progress_filter.is_empty() {
         None
     } else {
-        let (filter_program, filter_args) = config
-            .progress_filter
-            .split_first()
-            .ok_or_else(|| "agent.progress_filter is empty".to_string())?;
+        let (filter_program, filter_args) =
+            config
+                .progress_filter
+                .split_first()
+                .ok_or_else(|| AgentFailure {
+                    message: "agent.progress_filter is empty".to_string(),
+                    raw_stdout: String::new(),
+                    stderr_lines: Vec::new(),
+                })?;
         Some(
             Command::new(filter_program)
                 .args(filter_args)
@@ -52,8 +80,10 @@ pub fn run(repo_root: &Path, config: &AgentConfig, prompt: &str) -> Result<Agent
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()
-                .map_err(|error| {
-                    format!("failed spawning progress filter `{filter_program}`: {error}")
+                .map_err(|error| AgentFailure {
+                    message: format!("failed spawning progress filter `{filter_program}`: {error}"),
+                    raw_stdout: String::new(),
+                    stderr_lines: Vec::new(),
                 })?,
         )
     };
@@ -61,7 +91,11 @@ pub fn run(repo_root: &Path, config: &AgentConfig, prompt: &str) -> Result<Agent
     if let Some(mut stdin) = child.stdin.take() {
         stdin
             .write_all(prompt.as_bytes())
-            .map_err(|error| format!("failed writing prompt to agent stdin: {error}"))?;
+            .map_err(|error| AgentFailure {
+                message: format!("failed writing prompt to agent stdin: {error}"),
+                raw_stdout: String::new(),
+                stderr_lines: Vec::new(),
+            })?;
     }
 
     let stderr_lines = Arc::new(Mutex::new(Vec::new()));
@@ -80,10 +114,11 @@ pub fn run(repo_root: &Path, config: &AgentConfig, prompt: &str) -> Result<Agent
 
     let raw_stdout = Arc::new(Mutex::new(String::new()));
     let forward_thread = {
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| "agent stdout was not captured".to_string())?;
+        let stdout = child.stdout.take().ok_or_else(|| AgentFailure {
+            message: "agent stdout was not captured".to_string(),
+            raw_stdout: String::new(),
+            stderr_lines: Vec::new(),
+        })?;
         let raw_stdout = raw_stdout.clone();
         let mut filter_stdin = filter.as_mut().and_then(|child| child.stdin.take());
 
@@ -118,10 +153,11 @@ pub fn run(repo_root: &Path, config: &AgentConfig, prompt: &str) -> Result<Agent
     };
 
     let filter_stdout = if let Some(filter_child) = filter.as_mut() {
-        let stdout = filter_child
-            .stdout
-            .take()
-            .ok_or_else(|| "progress filter stdout was not captured".to_string())?;
+        let stdout = filter_child.stdout.take().ok_or_else(|| AgentFailure {
+            message: "progress filter stdout was not captured".to_string(),
+            raw_stdout: String::new(),
+            stderr_lines: Vec::new(),
+        })?;
         Some(thread::spawn(move || -> Result<String, String> {
             let mut reader = BufReader::new(stdout);
             let mut text = String::new();
@@ -134,36 +170,74 @@ pub fn run(repo_root: &Path, config: &AgentConfig, prompt: &str) -> Result<Agent
         None
     };
 
-    let status = child
-        .wait()
-        .map_err(|error| format!("failed waiting for agent process: {error}"))?;
+    let status = child.wait().map_err(|error| AgentFailure {
+        message: format!("failed waiting for agent process: {error}"),
+        raw_stdout: String::new(),
+        stderr_lines: Vec::new(),
+    })?;
     forward_thread
         .join()
-        .map_err(|_| "agent stdout forwarding thread panicked".to_string())??;
+        .map_err(|_| AgentFailure {
+            message: "agent stdout forwarding thread panicked".to_string(),
+            raw_stdout: String::new(),
+            stderr_lines: Vec::new(),
+        })?
+        .map_err(|message| AgentFailure {
+            message,
+            raw_stdout: String::new(),
+            stderr_lines: Vec::new(),
+        })?;
 
     let raw_stdout = raw_stdout
         .lock()
-        .map_err(|_| "failed locking raw stdout buffer".to_string())?
+        .map_err(|_| AgentFailure {
+            message: "failed locking raw stdout buffer".to_string(),
+            raw_stdout: String::new(),
+            stderr_lines: Vec::new(),
+        })?
         .clone();
 
     let assistant_text = if let Some(mut filter_child) = filter {
         let text = filter_stdout
-            .ok_or_else(|| "progress filter stdout thread was not started".to_string())?
+            .ok_or_else(|| AgentFailure {
+                message: "progress filter stdout thread was not started".to_string(),
+                raw_stdout: raw_stdout.clone(),
+                stderr_lines: Vec::new(),
+            })?
             .join()
-            .map_err(|_| "progress filter stdout thread panicked".to_string())??;
-        let filter_status = filter_child
-            .wait()
-            .map_err(|error| format!("failed waiting for progress filter: {error}"))?;
+            .map_err(|_| AgentFailure {
+                message: "progress filter stdout thread panicked".to_string(),
+                raw_stdout: raw_stdout.clone(),
+                stderr_lines: Vec::new(),
+            })?
+            .map_err(|message| AgentFailure {
+                message,
+                raw_stdout: raw_stdout.clone(),
+                stderr_lines: Vec::new(),
+            })?;
+        let filter_status = filter_child.wait().map_err(|error| AgentFailure {
+            message: format!("failed waiting for progress filter: {error}"),
+            raw_stdout: raw_stdout.clone(),
+            stderr_lines: Vec::new(),
+        })?;
         if !filter_status.success() {
             let stderr_lines = stderr_lines
                 .lock()
-                .map_err(|_| "failed locking stderr lines".to_string())?
+                .map_err(|_| AgentFailure {
+                    message: "failed locking stderr lines".to_string(),
+                    raw_stdout: raw_stdout.clone(),
+                    stderr_lines: Vec::new(),
+                })?
                 .clone();
-            return Err(format!(
-                "progress filter exited with status {}: {}",
-                filter_status.code().unwrap_or(-1),
-                stderr_lines.join("; ")
-            ));
+            return Err(AgentFailure {
+                message: format!(
+                    "progress filter exited with status {}: {}",
+                    filter_status.code().unwrap_or(-1),
+                    stderr_lines.join("; ")
+                ),
+                raw_stdout,
+                stderr_lines,
+            });
         }
         text
     } else {
@@ -173,20 +247,37 @@ pub fn run(repo_root: &Path, config: &AgentConfig, prompt: &str) -> Result<Agent
     for handle in stderr_threads {
         handle
             .join()
-            .map_err(|_| "stderr reader thread panicked".to_string())??;
+            .map_err(|_| AgentFailure {
+                message: "stderr reader thread panicked".to_string(),
+                raw_stdout: raw_stdout.clone(),
+                stderr_lines: Vec::new(),
+            })?
+            .map_err(|message| AgentFailure {
+                message,
+                raw_stdout: raw_stdout.clone(),
+                stderr_lines: Vec::new(),
+            })?;
     }
 
     let stderr_lines = stderr_lines
         .lock()
-        .map_err(|_| "failed locking stderr lines".to_string())?
+        .map_err(|_| AgentFailure {
+            message: "failed locking stderr lines".to_string(),
+            raw_stdout: raw_stdout.clone(),
+            stderr_lines: Vec::new(),
+        })?
         .clone();
 
     if !status.success() {
-        return Err(format!(
-            "agent exited with status {}: {}",
-            status.code().unwrap_or(-1),
-            stderr_lines.join("; ")
-        ));
+        return Err(AgentFailure {
+            message: format!(
+                "agent exited with status {}: {}",
+                status.code().unwrap_or(-1),
+                stderr_lines.join("; ")
+            ),
+            raw_stdout,
+            stderr_lines,
+        });
     }
 
     Ok(AgentResult {

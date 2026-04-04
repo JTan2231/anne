@@ -2,8 +2,6 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs,
     path::{Path, PathBuf},
-    process::Command,
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use crate::{
@@ -12,6 +10,7 @@ use crate::{
     config::{AgentConfig, AppConfig, ReviewConfig},
     git::{self, ChangeRecord},
     json::JsonValue,
+    util::{current_timestamp, slugify_text, string_array},
 };
 
 pub struct RunResult {
@@ -416,7 +415,7 @@ fn assign_patch_paths(files: &mut [ReviewFile]) {
         .iter_mut()
         .filter(|file| file.status == FileStatus::Queued)
     {
-        let stem = format!("{:04}-{}", index, slugify_path(&file.display_path));
+        let stem = format!("{:04}-{}", index, slugify_text(&file.display_path));
         file.patch_file = Some(format!("files/{stem}.patch"));
         index += 1;
     }
@@ -461,51 +460,14 @@ fn split_diff_sections(text: &str) -> Vec<String> {
     sections
 }
 
-fn current_timestamp() -> String {
-    if let Ok(output) = Command::new("date")
-        .args(["-u", "+%Y-%m-%dT%H:%M:%SZ"])
-        .output()
-    {
-        if output.status.success() {
-            return String::from_utf8_lossy(&output.stdout).trim().to_string();
-        }
-    }
-
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0);
-    format!("unix-{secs}")
-}
-
 fn build_review_id(timestamp: &str, base: &str, head: &str, short_merge_base: &str) -> String {
     format!(
         "{}-{}...{}-{}",
         timestamp.replace(':', "-"),
-        slugify_path(base),
-        slugify_path(head),
+        slugify_text(base),
+        slugify_text(head),
         short_merge_base
     )
-}
-
-fn slugify_path(path: &str) -> String {
-    let mut output = String::new();
-    let mut last_dash = false;
-    for ch in path.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '.' {
-            output.push(ch);
-            last_dash = false;
-        } else if !last_dash {
-            output.push('-');
-            last_dash = true;
-        }
-    }
-    let output = output.trim_matches('-').to_string();
-    if output.is_empty() {
-        "file".to_string()
-    } else {
-        output
-    }
 }
 
 fn parse_anchors(patch: &str) -> Result<AnchorMap, String> {
@@ -1201,10 +1163,6 @@ impl FileRecord {
         );
         JsonValue::Object(object)
     }
-}
-
-fn string_array(values: &[String]) -> JsonValue {
-    JsonValue::Array(values.iter().cloned().map(JsonValue::string).collect())
 }
 
 #[cfg(test)]
