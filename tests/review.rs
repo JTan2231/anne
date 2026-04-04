@@ -106,7 +106,10 @@ fn review_accepts_plain_agent_findings() {
     let comments_json = fs::read_to_string(bundle.join("comments.json")).unwrap();
     assert!(comments_json.contains("\"id\": \"R001\""));
     assert!(comments_json.contains("\"path\": \"src/lib.rs\""));
+    assert!(comments_json.contains("\"side\": \"new\""));
+    assert!(comments_json.contains("\"line\": 2"));
     assert!(comments_json.contains("\"patch_file\": \"files/0001-src-lib.rs.patch\""));
+    assert!(!comments_json.contains("\"anchor\""));
 
     let comments_md = fs::read_to_string(bundle.join("comments.md")).unwrap();
     assert!(comments_md.contains("### R001 warning new:2"));

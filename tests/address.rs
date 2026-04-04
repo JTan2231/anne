@@ -143,16 +143,23 @@ esac
     let first = selected_comments.find("\"id\": \"R001\"").unwrap();
     let second = selected_comments.find("\"id\": \"R002\"").unwrap();
     assert!(first < second, "selected comments were not sorted by id");
+    assert!(!selected_comments.contains("\"anchor\""));
 
     let summary = fs::read_to_string(bundle.join("summary.md")).unwrap();
     assert!(summary.contains("Comments selected: 2"));
     assert!(summary.contains("Specs generated: 2"));
+    assert!(summary.contains("## R001 src/lib.rs new:2"));
+    assert!(summary.contains("## R002 src/lib.rs new:6"));
     assert!(summary.contains("specs/R001-First-title.md"));
     assert!(summary.contains("specs/R002-Second-title.md"));
+
+    let prompt = fs::read_to_string(bundle.join("agent/R001.prompt.md")).unwrap();
+    assert!(prompt.contains("- Anchor: new:2"));
 
     let spec = fs::read_to_string(bundle.join("specs/R001-First-title.md")).unwrap();
     assert!(spec.contains("## Source Comment"));
     assert!(spec.contains("- Comment: R001"));
+    assert!(spec.contains("- Anchor: new:2"));
 
     let response = fs::read_to_string(bundle.join("agent/R001.response.txt")).unwrap();
     assert!(response.contains("FINAL-BEGIN"));
