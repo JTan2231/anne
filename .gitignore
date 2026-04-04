@@ -1,0 +1,6 @@
+/target
+.vizier/tmp-worktrees/
+.vizier/tmp/
+.vizier/sessions/
+.vizier/jobs/
+.vizier/implementation-plans
