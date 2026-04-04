@@ -4,3 +4,4 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+git2 = { version = "0.20.4", features = ["vendored-libgit2"] }

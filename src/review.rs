@@ -29,21 +29,19 @@ pub fn run(request: ReviewRequest) -> Result<RunResult, String> {
     let repo_root = git::repo_root(&cwd)?;
     let config = AppConfig::load(&repo_root)?;
 
-    let merge_base = git::merge_base(&repo_root, &request.base, &request.head)?;
-    let full_diff = git::full_diff(&repo_root, &merge_base, &request.head)?;
-    let changes = git::name_status(&repo_root, &merge_base, &request.head)?;
+    let review_range = git::review_range(&repo_root, &request.base, &request.head)?;
 
-    let diff_sections = split_diff_sections(&full_diff);
-    if diff_sections.len() != changes.len() {
+    let diff_sections = split_diff_sections(&review_range.full_diff);
+    if diff_sections.len() != review_range.changes.len() {
         return Err(format!(
-            "git diff returned {} file sections but --name-status returned {} entries",
+            "diff generation returned {} file sections but change enumeration returned {} entries",
             diff_sections.len(),
-            changes.len()
+            review_range.changes.len()
         ));
     }
 
     let generated_at = current_timestamp();
-    let short_merge_base = merge_base.chars().take(7).collect::<String>();
+    let short_merge_base = review_range.merge_base.chars().take(7).collect::<String>();
     let review_id = build_review_id(
         &generated_at,
         &request.base,
@@ -57,10 +55,10 @@ pub fn run(request: ReviewRequest) -> Result<RunResult, String> {
     fs::create_dir_all(bundle_root.join("agent"))
         .map_err(|error| format!("failed creating bundle agent dir: {error}"))?;
 
-    fs::write(bundle_root.join("diff.patch"), &full_diff)
+    fs::write(bundle_root.join("diff.patch"), &review_range.full_diff)
         .map_err(|error| format!("failed writing diff.patch: {error}"))?;
 
-    let mut files = build_files(&changes, &diff_sections, &config)?;
+    let mut files = build_files(&review_range.changes, &diff_sections, &config)?;
     assign_patch_paths(&mut files);
 
     for file in files
@@ -83,7 +81,7 @@ pub fn run(request: ReviewRequest) -> Result<RunResult, String> {
         range: format!("{}...{}", request.base, request.head),
         base: request.base.clone(),
         head: request.head.clone(),
-        merge_base: merge_base.clone(),
+        merge_base: review_range.merge_base.clone(),
         status: ManifestStatus::Running,
         bundle_path: relative_bundle_path.display().to_string(),
         diff_patch: "diff.patch".to_string(),
@@ -131,7 +129,7 @@ pub fn run(request: ReviewRequest) -> Result<RunResult, String> {
         let file_error = {
             let file = &mut files[index];
             let (prompt_file, response_file) = agent_artifact_paths(file);
-            let prompt = build_prompt(&request.base, &request.head, &merge_base, file);
+            let prompt = build_prompt(&request.base, &request.head, &review_range.merge_base, file);
 
             fs::write(bundle_root.join(&prompt_file), &prompt)
                 .map_err(|error| format!("failed writing {prompt_file}: {error}"))?;

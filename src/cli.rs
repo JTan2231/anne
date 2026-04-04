@@ -102,7 +102,7 @@ fn parse_review(args: &[String]) -> Result<Command, String> {
 
 fn root_help() -> String {
     format!(
-        "{binary}\n\nCommands:\n  review   Review <base>...<head> using git merge-base semantics\n\nRun `{binary} review --help` for details.",
+        "{binary}\n\nCommands:\n  review   Review <base>...<head> using merge-base semantics\n\nRun `{binary} review --help` for details.",
         binary = "anne"
     )
 }
@@ -119,7 +119,7 @@ Usage:
 
 Notes:
   - Triple-dot review is canonical user-facing syntax.
-  - Anne resolves `git merge-base <base> <head>` and reviews the diff from that merge base to `<head>`.
+  - Anne resolves the merge base between `<base>` and `<head>` and reviews the diff from that merge base to `<head>`.
   - Two-dot range math is intentionally not accepted here."
         .to_string()
 }

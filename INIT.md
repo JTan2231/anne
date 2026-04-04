@@ -53,10 +53,14 @@ anne review <base>...<head>
 
 Behavior:
 
-- Resolve `merge_base = git merge-base <base> <head>`.
+- Resolve the merge base between `<base>` and `<head>` via `libgit2`.
 - Review the textual diff from `merge_base` to `<head>`.
-- Default to `git diff --find-renames --binary --unified=3 <merge_base> <head>`.
+- Generate a rename-aware unified diff with binary signaling and three lines of context.
 - Treat `<base>...<head>` as the canonical user-facing meaning because it matches pull-request style review semantics.
+
+Implementation note:
+
+- Anne performs repository discovery, ref resolution, merge-base lookup, and diff generation through the Rust `git2` crate backed by `libgit2`; it does not require the system `git` executable.
 
 Reasoning:
 
@@ -97,7 +101,7 @@ Bundle contents:
 
 File meanings:
 
-- `manifest.json`: run metadata, git refs, merge base, skipped files, counts, runtime settings.
+- `manifest.json`: run metadata, base/head refs, merge base, skipped files, counts, runtime settings.
 - `diff.patch`: the full patch reviewed by anne.
 - `comments.md`: the readable review output.
 - `comments.json`: structured canonical findings for future automation.
@@ -286,7 +290,7 @@ Prompt requirements:
 
 ## Execution Flow
 
-1. Resolve git refs and merge base.
+1. Resolve base/head refs and merge base with `libgit2`.
 2. Collect changed files.
 3. Materialize bundle directory.
 4. Write full `diff.patch`.
@@ -315,7 +319,7 @@ Operational failures should be distinct from "agent found issues".
 
 - Agent invocation failure: command exits non-zero, bundle still written if possible, run exits non-zero.
 - Parse failure: raw response preserved under `agent/`, file marked failed in `manifest.json`, run exits non-zero.
-- Git resolution failure: no bundle or only a partial bundle with explicit error state.
+- Repository or ref resolution failure: no bundle or only a partial bundle with explicit error state.
 - Findings present: run exits 0 by default in v1.
 
 Possible later flag:
