@@ -1,6 +1,7 @@
 # Glossary
 
-- Review bundle: The on-disk artifact directory for one `anne review` run at `.anne/reviews/<review-id>/`, including the reviewed diff, manifest, rendered comments, structured findings, per-file patches, and raw agent I/O.
+- Review bundle: The on-disk artifact directory for one materialized `anne review` run at `.anne/reviews/<review-id>/`, including the reviewed diff, manifest, rendered comments, structured findings, per-file patches, and raw agent I/O. Anne does not guarantee that this directory exists during preflight failures.
+- Review materialization boundary: The point where Anne has finished preflight, knows `.anne/reviews/<review-id>/`, and starts creating that directory. From this point onward `anne review` reports the bundle path and preserves partial artifacts on operational failure.
 - Address bundle: The on-disk artifact directory for one `anne address` run at `.anne/address/<address-id>/`, including the selected source comments, manifest, readable summary, per-comment agent I/O, and generated feature specs.
 - Address spec validation: The lightweight acceptance gate Anne applies to the final assistant text for one address comment after any configured `progress_filter`: trim surrounding whitespace, reject empty output, reject output with no line whose first non-whitespace character is `#`, then normalize accepted specs by inserting `## Source Comment` when needed and ensuring a trailing newline.
 - Merge-base review: Anne’s canonical review scope. The command resolves the merge base between `<base>` and `<head>` through `libgit2` and reviews the diff from that merge base to the head ref rather than accepting two-dot range math.

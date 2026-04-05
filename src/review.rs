@@ -25,12 +25,15 @@ pub struct RunResult {
 }
 
 pub fn run(request: ReviewRequest) -> Result<RunResult, String> {
+    let prepared = prepare_run(&request)?;
+    Ok(run_materialized(request, prepared))
+}
+
+fn prepare_run(request: &ReviewRequest) -> Result<PreparedRun, String> {
     let cwd = env::current_dir().map_err(|error| format!("failed to read current dir: {error}"))?;
     let repo_root = git::repo_root(&cwd)?;
     let config = AppConfig::load(&repo_root)?;
-
     let review_range = git::review_range(&repo_root, &request.base, &request.head)?;
-
     let diff_sections = split_diff_sections(&review_range.full_diff);
     if diff_sections.len() != review_range.changes.len() {
         return Err(format!(
@@ -50,53 +53,91 @@ pub fn run(request: ReviewRequest) -> Result<RunResult, String> {
     );
     let relative_bundle_path = PathBuf::from(".anne").join("reviews").join(&review_id);
     let bundle_root = repo_root.join(&relative_bundle_path);
-    fs::create_dir_all(bundle_root.join("files"))
-        .map_err(|error| format!("failed creating bundle files dir: {error}"))?;
-    fs::create_dir_all(bundle_root.join("agent"))
-        .map_err(|error| format!("failed creating bundle agent dir: {error}"))?;
+    Ok(PreparedRun {
+        repo_root,
+        config,
+        review_range,
+        diff_sections,
+        generated_at,
+        review_id,
+        relative_bundle_path,
+        bundle_root,
+    })
+}
 
-    fs::write(bundle_root.join("diff.patch"), &review_range.full_diff)
-        .map_err(|error| format!("failed writing diff.patch: {error}"))?;
+fn run_materialized(request: ReviewRequest, prepared: PreparedRun) -> RunResult {
+    let PreparedRun {
+        repo_root,
+        config,
+        review_range,
+        diff_sections,
+        generated_at,
+        review_id,
+        relative_bundle_path,
+        bundle_root,
+    } = prepared;
+    let bundle_path = relative_bundle_path.display().to_string();
 
-    let mut files = build_files(&review_range.changes, &diff_sections, &config)?;
+    if let Err(error) = fs::create_dir_all(bundle_root.join("files"))
+        .map_err(|error| format!("failed creating bundle files dir: {error}"))
+    {
+        return post_materialization_failure(&bundle_path, error);
+    }
+    if let Err(error) = fs::create_dir_all(bundle_root.join("agent"))
+        .map_err(|error| format!("failed creating bundle agent dir: {error}"))
+    {
+        return post_materialization_failure(&bundle_path, error);
+    }
+
+    let mut files = match build_files(&review_range.changes, &diff_sections, &config) {
+        Ok(files) => files,
+        Err(error) => return post_materialization_failure(&bundle_path, error),
+    };
     assign_patch_paths(&mut files);
+
+    let mut manifest = build_manifest(
+        &request,
+        &review_range,
+        &config,
+        review_id,
+        generated_at,
+        bundle_path,
+        &files,
+    );
+
+    if let Err(error) = write_manifest(&bundle_root, &manifest) {
+        return failure_result_from_manifest(&mut manifest, error);
+    }
+
+    if let Err(error) = fs::write(bundle_root.join("diff.patch"), &review_range.full_diff)
+        .map_err(|error| format!("failed writing diff.patch: {error}"))
+    {
+        return persist_failed_manifest(&bundle_root, &mut manifest, error);
+    }
 
     for file in files
         .iter()
         .filter(|file| file.status == FileStatus::Queued)
     {
-        let patch_file = file.patch_file.as_ref().ok_or_else(|| {
-            format!(
-                "reviewable file {} is missing a patch_file path",
-                file.display_path
-            )
-        })?;
-        fs::write(bundle_root.join(patch_file), &file.patch_text)
-            .map_err(|error| format!("failed writing {patch_file}: {error}"))?;
+        let patch_file = match file.patch_file.as_ref() {
+            Some(path) => path,
+            None => {
+                return persist_failed_manifest(
+                    &bundle_root,
+                    &mut manifest,
+                    format!(
+                        "reviewable file {} is missing a patch_file path",
+                        file.display_path
+                    ),
+                );
+            }
+        };
+        if let Err(error) = fs::write(bundle_root.join(patch_file), &file.patch_text)
+            .map_err(|error| format!("failed writing {patch_file}: {error}"))
+        {
+            return persist_failed_manifest(&bundle_root, &mut manifest, error);
+        }
     }
-
-    let mut manifest = Manifest {
-        review_id,
-        generated_at: generated_at.clone(),
-        range: format!("{}...{}", request.base, request.head),
-        base: request.base.clone(),
-        head: request.head.clone(),
-        merge_base: review_range.merge_base.clone(),
-        status: ManifestStatus::Running,
-        bundle_path: relative_bundle_path.display().to_string(),
-        diff_patch: "diff.patch".to_string(),
-        comments_markdown: "comments.md".to_string(),
-        comments_json: "comments.json".to_string(),
-        runtime: RuntimeManifest {
-            agent: config.agent.clone(),
-            review: config.review.clone(),
-        },
-        files: files.iter().map(FileRecord::from_review_file).collect(),
-        counts: Counts::default(),
-        errors: Vec::new(),
-    };
-    update_counts(&mut manifest);
-    write_manifest(&bundle_root, &manifest)?;
 
     if files.iter().any(|file| file.status == FileStatus::Queued) && config.agent.command.is_empty()
     {
@@ -114,8 +155,10 @@ pub fn run(request: ReviewRequest) -> Result<RunResult, String> {
         manifest.status = ManifestStatus::Failed;
         sync_manifest_files(&mut manifest, &files);
         update_counts(&mut manifest);
-        write_outputs(&bundle_root, &manifest, &[])?;
-        return Ok(to_run_result(&manifest, Some(error)));
+        if let Err(write_error) = write_outputs(&bundle_root, &manifest, &[]) {
+            return persist_failed_manifest(&bundle_root, &mut manifest, write_error);
+        }
+        return to_run_result(&manifest, Some(error));
     }
 
     let files = RefCell::new(files);
@@ -133,7 +176,7 @@ pub fn run(request: ReviewRequest) -> Result<RunResult, String> {
         })
         .collect::<Vec<_>>();
 
-    agent::run_bounded(
+    let bounded_result = agent::run_bounded(
         config.agent.workers,
         queued_jobs,
         |_, job| {
@@ -184,11 +227,16 @@ pub fn run(request: ReviewRequest) -> Result<RunResult, String> {
             update_counts(&mut manifest);
             write_manifest(&bundle_root, &manifest)
         },
-    )?;
+    );
 
     let mut files = files.into_inner();
     let mut manifest = manifest.into_inner();
     let mut findings = findings.into_inner();
+
+    if let Err(error) = bounded_result {
+        sync_manifest_files(&mut manifest, &files);
+        return failure_result_from_manifest(&mut manifest, error);
+    }
 
     findings.sort_by(|left, right| {
         left.path
@@ -208,9 +256,94 @@ pub fn run(request: ReviewRequest) -> Result<RunResult, String> {
         ManifestStatus::Failed
     };
     update_counts(&mut manifest);
-    write_outputs(&bundle_root, &manifest, &findings)?;
+    if let Err(error) = write_outputs(&bundle_root, &manifest, &findings) {
+        return persist_failed_manifest(&bundle_root, &mut manifest, error);
+    }
 
-    Ok(to_run_result(&manifest, manifest.errors.first().cloned()))
+    to_run_result(&manifest, manifest.errors.first().cloned())
+}
+
+struct PreparedRun {
+    repo_root: PathBuf,
+    config: AppConfig,
+    review_range: git::ReviewRange,
+    diff_sections: Vec<String>,
+    generated_at: String,
+    review_id: String,
+    relative_bundle_path: PathBuf,
+    bundle_root: PathBuf,
+}
+
+fn build_manifest(
+    request: &ReviewRequest,
+    review_range: &git::ReviewRange,
+    config: &AppConfig,
+    review_id: String,
+    generated_at: String,
+    bundle_path: String,
+    files: &[ReviewFile],
+) -> Manifest {
+    let mut manifest = Manifest {
+        review_id,
+        generated_at,
+        range: format!("{}...{}", request.base, request.head),
+        base: request.base.clone(),
+        head: request.head.clone(),
+        merge_base: review_range.merge_base.clone(),
+        status: ManifestStatus::Running,
+        bundle_path,
+        diff_patch: "diff.patch".to_string(),
+        comments_markdown: "comments.md".to_string(),
+        comments_json: "comments.json".to_string(),
+        runtime: RuntimeManifest {
+            agent: config.agent.clone(),
+            review: config.review.clone(),
+        },
+        files: files.iter().map(FileRecord::from_review_file).collect(),
+        counts: Counts::default(),
+        errors: Vec::new(),
+    };
+    update_counts(&mut manifest);
+    manifest
+}
+
+fn post_materialization_failure(bundle_path: &str, error: String) -> RunResult {
+    RunResult {
+        bundle_path: Some(bundle_path.to_string()),
+        files_reviewed: 0,
+        files_skipped: 0,
+        files_failed: 0,
+        findings: 0,
+        success: false,
+        error: Some(error),
+    }
+}
+
+fn failure_result_from_manifest(manifest: &mut Manifest, error: String) -> RunResult {
+    mark_manifest_failed(manifest, &error);
+    to_run_result(manifest, Some(error))
+}
+
+fn persist_failed_manifest(
+    bundle_root: &Path,
+    manifest: &mut Manifest,
+    error: String,
+) -> RunResult {
+    mark_manifest_failed(manifest, &error);
+    let error = match write_manifest(bundle_root, manifest) {
+        Ok(()) => error,
+        Err(write_error) if write_error == error => error,
+        Err(write_error) => format!("{error}; {write_error}"),
+    };
+    to_run_result(manifest, Some(error))
+}
+
+fn mark_manifest_failed(manifest: &mut Manifest, error: &str) {
+    manifest.status = ManifestStatus::Failed;
+    if manifest.errors.iter().all(|existing| existing != error) {
+        manifest.errors.push(error.to_string());
+    }
+    update_counts(manifest);
 }
 
 fn review_file(

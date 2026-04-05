@@ -81,6 +81,11 @@ Suggested `<review-id>` format:
 2026-04-03T18-42-10Z-main...feature-login-1a2b3c4
 ```
 
+Review phases:
+
+- Preflight: repository discovery, config loading, ref resolution, merge-base lookup, diff generation/splitting, and review-id construction. No path under `.anne/reviews/` is guaranteed in this phase.
+- Materialized run: once Anne starts creating `.anne/reviews/<review-id>/`, later operational failures keep the partial bundle on disk and continue reporting that bundle path.
+
 Bundle contents:
 
 ```text
@@ -290,19 +295,18 @@ Prompt requirements:
 
 ## Execution Flow
 
-1. Resolve base/head refs and merge base with `libgit2`.
-2. Collect changed files.
-3. Materialize bundle directory.
-4. Write full `diff.patch`.
-5. For each reviewable file:
+1. Resolve the repository, load config, resolve base/head refs, compute the merge base, render the review diff, split it into per-file sections, and build the review id.
+2. Materialize the bundle directory.
+3. Write the initial `manifest.json` plus full `diff.patch`.
+4. For each reviewable file:
    - write `files/<n>-<path>.patch`
    - build prompt
    - invoke agent using the configured runtime
    - persist raw prompt/response
    - parse JSON findings
-6. Aggregate all findings into `comments.json`.
-7. Render `comments.md`.
-8. Print bundle path and summary counts to stdout.
+5. Aggregate all findings into `comments.json`.
+6. Render `comments.md`.
+7. Print bundle path and summary counts to stdout only after materialization has begun.
 
 Suggested terminal summary:
 
@@ -319,7 +323,8 @@ Operational failures should be distinct from "agent found issues".
 
 - Agent invocation failure: command exits non-zero, bundle still written if possible, run exits non-zero.
 - Parse failure: raw response preserved under `agent/`, file marked failed in `manifest.json`, run exits non-zero.
-- Repository or ref resolution failure: no bundle or only a partial bundle with explicit error state.
+- Repository or ref resolution failure: preflight error, no review bundle is created or reported.
+- Bundle or artifact write failure after materialization starts: keep any partial bundle on disk, report its path, and exit non-zero.
 - Findings present: run exits 0 by default in v1.
 
 Possible later flag:

@@ -117,6 +117,38 @@ fn review_accepts_plain_agent_findings() {
 }
 
 #[test]
+fn review_bad_ref_fails_before_bundle_creation() {
+    let repo = TestRepo::new("bad-ref-preflight");
+    init_repo(repo.path());
+
+    write_file(
+        &repo.path().join("src/lib.rs"),
+        "pub fn value() -> i32 {\n    1\n}\n",
+    );
+    commit_all(repo.path(), "initial");
+
+    let output = anne(repo.path(), &["review", "main...missing"]);
+    assert!(
+        !output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stdout.contains("Review bundle:"));
+    assert!(stderr.contains("failed resolving head ref `missing`"));
+
+    let reviews_root = repo.path().join(".anne").join("reviews");
+    let review_entries = fs::read_dir(&reviews_root)
+        .ok()
+        .map(|entries| entries.count())
+        .unwrap_or(0);
+    assert_eq!(review_entries, 0);
+}
+
+#[test]
 fn review_uses_bundled_default_agent_shim_when_config_is_missing() {
     let repo = TestRepo::new("bundled-default");
     init_repo(repo.path());
@@ -161,6 +193,63 @@ fn review_uses_bundled_default_agent_shim_when_config_is_missing() {
 
     let response = fs::read_to_string(bundle.join("agent/0001-src-lib.rs.response.txt")).unwrap();
     assert!(response.contains("\"agent_message\""));
+}
+
+#[test]
+fn review_preserves_bundle_path_when_final_output_write_fails() {
+    let repo = TestRepo::new("output-write-failure");
+    init_repo(repo.path());
+
+    write_file(
+        &repo.path().join("src/lib.rs"),
+        "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n",
+    );
+    commit_all(repo.path(), "initial");
+
+    create_and_checkout_branch(repo.path(), "feature");
+    write_file(
+        &repo.path().join("src/lib.rs"),
+        "pub fn add(a: i32, b: i32) -> i32 {\n    a + b + 1\n}\n",
+    );
+    commit_all(repo.path(), "feature changes");
+
+    checkout_branch(repo.path(), "main");
+
+    let agent = agent_script(
+        repo.path(),
+        "while IFS= read -r _line; do :; done\nprintf '[]\\n'\n",
+    );
+    write_agent_config(repo.path(), "text", &agent, None);
+
+    let bin_dir = repo.path().join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    fixed_date_script(&bin_dir, "2026-04-04T00:00:00Z");
+
+    let review_id = review_bundle_id(repo.path(), "main", "feature", "2026-04-04T00:00:00Z");
+    let bundle = repo.path().join(".anne").join("reviews").join(&review_id);
+    fs::create_dir_all(bundle.join("comments.md")).unwrap();
+
+    let path_env = prepend_path(&bin_dir);
+    let output = anne_with_path(repo.path(), &["review", "main...feature"], Some(&path_env));
+    assert!(
+        !output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout_bundle = bundle_path(repo.path(), &output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(stdout_bundle, bundle);
+    assert!(stderr.contains("failed writing comments.md"));
+
+    let manifest = fs::read_to_string(bundle.join("manifest.json")).unwrap();
+    assert!(manifest.contains("\"status\": \"failed\""));
+    assert!(manifest.contains("failed writing comments.md"));
+
+    let comments_json = fs::read_to_string(bundle.join("comments.json")).unwrap();
+    assert_eq!(comments_json.trim(), "[]");
+    assert!(bundle.join("comments.md").is_dir());
 }
 
 #[test]
@@ -707,6 +796,50 @@ PY
 "#,
     );
     script
+}
+
+fn fixed_date_script(path: &Path, timestamp: &str) -> PathBuf {
+    let script = path.join("date");
+    write_executable(
+        &script,
+        &format!("#!/bin/sh\nset -eu\nprintf '%s\\n' '{}'\n", timestamp),
+    );
+    script
+}
+
+fn review_bundle_id(repo: &Path, base: &str, head: &str, timestamp: &str) -> String {
+    let repo = open_repo(repo);
+    let base_oid = repo.revparse_single(base).unwrap().id();
+    let head_oid = repo.revparse_single(head).unwrap().id();
+    let merge_base = repo.merge_base(base_oid, head_oid).unwrap().to_string();
+    format!(
+        "{}-{}...{}-{}",
+        timestamp.replace(':', "-"),
+        slugify_for_review_id(base),
+        slugify_for_review_id(head),
+        &merge_base[..7]
+    )
+}
+
+fn slugify_for_review_id(text: &str) -> String {
+    let mut output = String::new();
+    let mut last_dash = false;
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '.' {
+            output.push(ch);
+            last_dash = false;
+        } else if !last_dash {
+            output.push('-');
+            last_dash = true;
+        }
+    }
+
+    let output = output.trim_matches('-').to_string();
+    if output.is_empty() {
+        "file".to_string()
+    } else {
+        output
+    }
 }
 
 fn prepend_path(dir: &Path) -> String {
