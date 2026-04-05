@@ -206,6 +206,9 @@ Usage:
   anne filter
 
 Keys:
+  Up/Down      scroll the visible patch one line
+  Left/Right   scroll the visible patch horizontally
+  PgUp/PgDn    scroll the visible patch by one page
   n   keep the current comment and move to the next one
   d   delete the current comment from the selected review bundle
   q   quit immediately and keep the remaining comments unchanged
