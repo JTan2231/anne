@@ -4,4 +4,5 @@
 .vizier/sessions/
 .vizier/jobs/
 .vizier/implementation-plans
+.vizier/state/
 .anne/
