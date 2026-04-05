@@ -1,0 +1,16 @@
+{
+  "plan_id": "pln_52c6f66eec604b22b2bd866a69a22285",
+  "slug": "r007-new-git2-dependency-introdu",
+  "branch": "draft/r007-new-git2-dependency-introdu",
+  "source": "inline",
+  "intent": null,
+  "target_branch": null,
+  "work_ref": "workflow-job:wf-run_6224da5734264a4cab8a08c7c582a5b9-develop_draft__persist_plan",
+  "status": "proposed",
+  "summary": "This change is a build-contract tightening around Cargo.toml, Cargo.lock, and the repository CI entrypoint ci.sh. The...",
+  "created_at": "2026-04-05T03:54:13.188076386+00:00",
+  "updated_at": "2026-04-05T03:54:13.188076386+00:00",
+  "job_ids": {
+    "persist": "wf-run_6224da5734264a4cab8a08c7c582a5b9-develop_draft__persist_plan"
+  }
+}

@@ -654,6 +654,76 @@ fn tracked_src_and_tests_rust_files_and_shell_scripts_do_not_invoke_git_cli() {
     }
 }
 
+#[test]
+fn default_dependency_graph_excludes_remote_transport_native_crates() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let tree = cargo_stdout(
+        repo_root,
+        &[
+            "tree",
+            "--locked",
+            "--offline",
+            "-e",
+            "all",
+            "--prefix",
+            "none",
+        ],
+    );
+
+    assert!(
+        !tree.contains("openssl-sys v"),
+        "default dependency graph unexpectedly contains openssl-sys:\n{tree}"
+    );
+    assert!(
+        !tree.contains("libssh2-sys v"),
+        "default dependency graph unexpectedly contains libssh2-sys:\n{tree}"
+    );
+}
+
+#[test]
+fn default_git2_feature_surface_stays_local_only() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let outgoing_tree = cargo_stdout(
+        repo_root,
+        &[
+            "tree",
+            "--locked",
+            "--offline",
+            "-e",
+            "features",
+            "-p",
+            "git2",
+        ],
+    );
+    let incoming_tree = cargo_stdout(
+        repo_root,
+        &[
+            "tree",
+            "--locked",
+            "--offline",
+            "-e",
+            "features",
+            "-i",
+            "git2",
+        ],
+    );
+
+    assert!(
+        incoming_tree.contains("git2 feature \"vendored-libgit2\""),
+        "default git2 feature graph lost vendored-libgit2:\n{incoming_tree}"
+    );
+    for forbidden in [
+        "git2 feature \"default\"",
+        "git2 feature \"https\"",
+        "git2 feature \"ssh\"",
+    ] {
+        assert!(
+            !outgoing_tree.contains(forbidden),
+            "default git2 feature graph unexpectedly contains {forbidden}:\n{outgoing_tree}"
+        );
+    }
+}
+
 fn init_repo(path: &Path) {
     let mut options = RepositoryInitOptions::new();
     options.initial_head("main");
@@ -873,6 +943,23 @@ fn anne_with_path(path: &Path, args: &[&str], path_env: Option<&str>) -> Output 
         command.env("PATH", path_env);
     }
     command.output().unwrap()
+}
+
+fn cargo_stdout(repo_root: &Path, args: &[&str]) -> String {
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    let output = Command::new(cargo)
+        .args(args)
+        .current_dir(repo_root)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "cargo {} failed\nstdout:\n{}\nstderr:\n{}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
 fn commit_all(path: &Path, message: &str) {

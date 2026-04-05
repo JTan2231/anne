@@ -2,6 +2,7 @@
 name = "anne"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 
 [dependencies]
-git2 = { version = "0.20.4", features = ["vendored-libgit2"] }
+git2 = { version = "0.20.4", default-features = false, features = ["vendored-libgit2"] }
