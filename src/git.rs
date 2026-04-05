@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use git2::{Commit, Delta, DiffFindOptions, DiffFormat, DiffOptions, Repository};
+use git2::{Commit, Delta, DiffFindOptions, DiffFormat, DiffOptions, Oid, Repository};
 
 #[derive(Debug, Clone)]
 pub struct ChangeRecord {
@@ -38,23 +38,7 @@ pub fn repo_root(cwd: &Path) -> Result<PathBuf, String> {
         .unwrap_or_else(|| repo.path().to_path_buf()))
 }
 
-pub fn review_range(repo_root: &Path, base: &str, head: &str) -> Result<ReviewRange, String> {
-    let repo = open_repo(repo_root)?;
-    let base_commit = resolve_commit(&repo, base, "base")?;
-    let head_commit = resolve_commit(&repo, head, "head")?;
-    let merge_base_oid = repo
-        .merge_base(base_commit.id(), head_commit.id())
-        .map_err(|error| {
-            format!("failed resolving merge base for `{base}` and `{head}`: {error}")
-        })?;
-    let merge_base_commit = repo
-        .find_commit(merge_base_oid)
-        .map_err(|error| format!("failed loading merge base `{merge_base_oid}`: {error}"))?;
-
-    build_review_range(&repo, &merge_base_commit, &head_commit)
-}
-
-fn open_repo(repo_root: &Path) -> Result<Repository, String> {
+pub fn open_repo(repo_root: &Path) -> Result<Repository, String> {
     Repository::open(repo_root).map_err(|error| {
         format!(
             "failed opening repository at {}: {error}",
@@ -63,20 +47,43 @@ fn open_repo(repo_root: &Path) -> Result<Repository, String> {
     })
 }
 
-fn resolve_commit<'repo>(
-    repo: &'repo Repository,
-    spec: &str,
-    label: &str,
-) -> Result<Commit<'repo>, String> {
+pub fn resolve_commit_oid(repo: &Repository, spec: &str, label: &str) -> Result<Oid, String> {
     let object = repo
         .revparse_single(spec)
         .map_err(|error| format!("failed resolving {label} ref `{spec}`: {error}"))?;
     object
         .peel_to_commit()
+        .map(|commit| commit.id())
         .map_err(|error| format!("ref `{spec}` for {label} does not resolve to a commit: {error}"))
 }
 
-fn build_review_range(
+pub fn resolve_merge_base_oid(
+    repo: &Repository,
+    base_oid: Oid,
+    head_oid: Oid,
+    base: &str,
+    head: &str,
+) -> Result<Oid, String> {
+    repo.merge_base(base_oid, head_oid)
+        .map_err(|error| format!("failed resolving merge base for `{base}` and `{head}`: {error}"))
+}
+
+pub fn build_review_range(
+    repo: &Repository,
+    merge_base_oid: Oid,
+    head_oid: Oid,
+) -> Result<ReviewRange, String> {
+    let merge_base = repo
+        .find_commit(merge_base_oid)
+        .map_err(|error| format!("failed loading merge base `{merge_base_oid}`: {error}"))?;
+    let head = repo
+        .find_commit(head_oid)
+        .map_err(|error| format!("failed loading head `{head_oid}`: {error}"))?;
+
+    build_review_range_from_commits(repo, &merge_base, &head)
+}
+
+fn build_review_range_from_commits(
     repo: &Repository,
     merge_base: &Commit<'_>,
     head: &Commit<'_>,

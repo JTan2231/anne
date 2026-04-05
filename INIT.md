@@ -78,13 +78,14 @@ Each run writes a bundle under:
 Suggested `<review-id>` format:
 
 ```text
-2026-04-03T18-42-10Z-main...feature-login-1a2b3c4
+2026-04-03T18-42-10Z-main...feature-login
 ```
 
 Review phases:
 
-- Preflight: repository discovery, config loading, ref resolution, merge-base lookup, diff generation/splitting, and review-id construction. No path under `.anne/reviews/` is guaranteed in this phase.
-- Materialized run: once Anne starts creating `.anne/reviews/<review-id>/`, later operational failures keep the partial bundle on disk and continue reporting that bundle path.
+- Bundle-less setup: repository discovery and config loading. No path under `.anne/reviews/` is guaranteed in this phase.
+- Preflight bundle: once Anne allocates `<review-id>`, it creates `.anne/reviews/<review-id>/`, writes an initial `manifest.json` with `stage = preflight`, then resolves repository open, base/head refs, merge base, and the full diff. Failures in this phase still report the bundle path and persist a readable failure bundle.
+- File review: after `diff.patch` is written, Anne enumerates reviewable files, writes `files/` and `agent/` artifacts, and finishes the rendered review output.
 
 Bundle contents:
 
@@ -104,9 +105,18 @@ Bundle contents:
     0002-src-session.rs.response.txt
 ```
 
+Preflight failure bundles only guarantee:
+
+```text
+.anne/reviews/<review-id>/
+  manifest.json
+  comments.md
+  comments.json
+```
+
 File meanings:
 
-- `manifest.json`: run metadata, base/head refs, merge base, skipped files, counts, runtime settings.
+- `manifest.json`: run metadata, base/head refs, preflight progress, stage, merge base when resolved, skipped files, counts, runtime settings, and operational errors.
 - `diff.patch`: the full patch reviewed by anne.
 - `comments.md`: the readable review output.
 - `comments.json`: structured canonical findings for future automation.
@@ -295,23 +305,26 @@ Prompt requirements:
 
 ## Execution Flow
 
-1. Resolve the repository, load config, resolve base/head refs, compute the merge base, render the review diff, split it into per-file sections, and build the review id.
-2. Materialize the bundle directory.
-3. Write the initial `manifest.json` plus full `diff.patch`.
-4. For each reviewable file:
+1. Discover the repository root and load config.
+2. Allocate the review id, materialize `.anne/reviews/<review-id>/`, and write the initial `manifest.json` with `stage = preflight`.
+3. Open the repository, resolve base/head refs, compute the merge base, and generate the full diff.
+4. If step 3 fails, update `manifest.json`, write `comments.json = []`, render a failure-focused `comments.md`, and exit non-zero.
+5. Write `diff.patch`, split the diff into per-file sections, and build the reviewable file list.
+6. For each reviewable file:
    - write `files/<n>-<path>.patch`
    - build prompt
    - invoke agent using the configured runtime
    - persist raw prompt/response
    - parse JSON findings
-5. Aggregate all findings into `comments.json`.
-6. Render `comments.md`.
-7. Print bundle path and summary counts to stdout only after materialization has begun.
+7. Aggregate all findings into `comments.json`.
+8. Render `comments.md`.
+9. Write the final `manifest.json` with `stage = rendered`.
+10. Print bundle path and summary counts to stdout whenever a bundle was materialized.
 
 Suggested terminal summary:
 
 ```text
-Review bundle: .anne/reviews/2026-04-03T18-42-10Z-main...feature-login-1a2b3c4
+Review bundle: .anne/reviews/2026-04-03T18-42-10Z-main...feature-login
 Files reviewed: 12
 Files skipped: 2
 Findings: 3
@@ -323,7 +336,8 @@ Operational failures should be distinct from "agent found issues".
 
 - Agent invocation failure: command exits non-zero, bundle still written if possible, run exits non-zero.
 - Parse failure: raw response preserved under `agent/`, file marked failed in `manifest.json`, run exits non-zero.
-- Repository or ref resolution failure: preflight error, no review bundle is created or reported.
+- Repository discovery failure: no review bundle is created or reported.
+- Repository-open, ref-resolution, merge-base, or diff-generation failure after discovery: Anne keeps the preflight bundle on disk, writes `comments.json = []`, renders a failure `comments.md`, reports the bundle path, and exits non-zero.
 - Bundle or artifact write failure after materialization starts: keep any partial bundle on disk, report its path, and exit non-zero.
 - Findings present: run exits 0 by default in v1.
 

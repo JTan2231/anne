@@ -33,31 +33,13 @@ fn prepare_run(request: &ReviewRequest) -> Result<PreparedRun, String> {
     let cwd = env::current_dir().map_err(|error| format!("failed to read current dir: {error}"))?;
     let repo_root = git::repo_root(&cwd)?;
     let config = AppConfig::load(&repo_root)?;
-    let review_range = git::review_range(&repo_root, &request.base, &request.head)?;
-    let diff_sections = split_diff_sections(&review_range.full_diff);
-    if diff_sections.len() != review_range.changes.len() {
-        return Err(format!(
-            "diff generation returned {} file sections but change enumeration returned {} entries",
-            diff_sections.len(),
-            review_range.changes.len()
-        ));
-    }
-
     let generated_at = current_timestamp();
-    let short_merge_base = review_range.merge_base.chars().take(7).collect::<String>();
-    let review_id = build_review_id(
-        &generated_at,
-        &request.base,
-        &request.head,
-        &short_merge_base,
-    );
+    let review_id = build_review_id(&generated_at, &request.base, &request.head);
     let relative_bundle_path = PathBuf::from(".anne").join("reviews").join(&review_id);
     let bundle_root = repo_root.join(&relative_bundle_path);
     Ok(PreparedRun {
         repo_root,
         config,
-        review_range,
-        diff_sections,
         generated_at,
         review_id,
         relative_bundle_path,
@@ -69,8 +51,6 @@ fn run_materialized(request: ReviewRequest, prepared: PreparedRun) -> RunResult 
     let PreparedRun {
         repo_root,
         config,
-        review_range,
-        diff_sections,
         generated_at,
         review_id,
         relative_bundle_path,
@@ -78,39 +58,125 @@ fn run_materialized(request: ReviewRequest, prepared: PreparedRun) -> RunResult 
     } = prepared;
     let bundle_path = relative_bundle_path.display().to_string();
 
-    if let Err(error) = fs::create_dir_all(bundle_root.join("files"))
-        .map_err(|error| format!("failed creating bundle files dir: {error}"))
+    if let Err(error) = fs::create_dir_all(&bundle_root)
+        .map_err(|error| format!("failed creating review bundle: {error}"))
     {
         return post_materialization_failure(&bundle_path, error);
     }
-    if let Err(error) = fs::create_dir_all(bundle_root.join("agent"))
-        .map_err(|error| format!("failed creating bundle agent dir: {error}"))
+
+    let mut manifest = build_manifest(&request, &config, review_id, generated_at, bundle_path);
+    if let Err(result) = persist_running_manifest(&bundle_root, &mut manifest) {
+        return result;
+    }
+
+    let repo = match git::open_repo(&repo_root) {
+        Ok(repo) => {
+            manifest.preflight.repository_opened = true;
+            if let Err(result) = persist_running_manifest(&bundle_root, &mut manifest) {
+                return result;
+            }
+            repo
+        }
+        Err(error) => return persist_preflight_failure(&bundle_root, &mut manifest, error),
+    };
+
+    let base_oid = match git::resolve_commit_oid(&repo, &request.base, "base") {
+        Ok(base_oid) => {
+            manifest.preflight.base_resolved = true;
+            if let Err(result) = persist_running_manifest(&bundle_root, &mut manifest) {
+                return result;
+            }
+            base_oid
+        }
+        Err(error) => return persist_preflight_failure(&bundle_root, &mut manifest, error),
+    };
+
+    let head_oid = match git::resolve_commit_oid(&repo, &request.head, "head") {
+        Ok(head_oid) => {
+            manifest.preflight.head_resolved = true;
+            if let Err(result) = persist_running_manifest(&bundle_root, &mut manifest) {
+                return result;
+            }
+            head_oid
+        }
+        Err(error) => return persist_preflight_failure(&bundle_root, &mut manifest, error),
+    };
+
+    let merge_base_oid = match git::resolve_merge_base_oid(
+        &repo,
+        base_oid,
+        head_oid,
+        &request.base,
+        &request.head,
+    ) {
+        Ok(merge_base_oid) => {
+            manifest.preflight.merge_base_resolved = true;
+            manifest.merge_base = Some(merge_base_oid.to_string());
+            if let Err(result) = persist_running_manifest(&bundle_root, &mut manifest) {
+                return result;
+            }
+            merge_base_oid
+        }
+        Err(error) => return persist_preflight_failure(&bundle_root, &mut manifest, error),
+    };
+
+    let review_range = match git::build_review_range(&repo, merge_base_oid, head_oid) {
+        Ok(review_range) => {
+            manifest.preflight.diff_generated = true;
+            if let Err(result) = persist_running_manifest(&bundle_root, &mut manifest) {
+                return result;
+            }
+            review_range
+        }
+        Err(error) => return persist_preflight_failure(&bundle_root, &mut manifest, error),
+    };
+
+    if let Err(error) = fs::write(bundle_root.join("diff.patch"), &review_range.full_diff)
+        .map_err(|error| format!("failed writing diff.patch: {error}"))
     {
-        return post_materialization_failure(&bundle_path, error);
+        return persist_preflight_failure(&bundle_root, &mut manifest, error);
+    }
+    manifest.diff_patch = Some("diff.patch".to_string());
+    if let Err(result) = persist_running_manifest(&bundle_root, &mut manifest) {
+        return result;
+    }
+
+    let diff_sections = split_diff_sections(&review_range.full_diff);
+    if diff_sections.len() != review_range.changes.len() {
+        manifest.stage = ManifestStage::FileReview;
+        return persist_failed_manifest(
+            &bundle_root,
+            &mut manifest,
+            format!(
+                "diff generation returned {} file sections but change enumeration returned {} entries",
+                diff_sections.len(),
+                review_range.changes.len()
+            ),
+        );
     }
 
     let mut files = match build_files(&review_range.changes, &diff_sections, &config) {
         Ok(files) => files,
-        Err(error) => return post_materialization_failure(&bundle_path, error),
+        Err(error) => {
+            manifest.stage = ManifestStage::FileReview;
+            return persist_failed_manifest(&bundle_root, &mut manifest, error);
+        }
     };
     assign_patch_paths(&mut files);
-
-    let mut manifest = build_manifest(
-        &request,
-        &review_range,
-        &config,
-        review_id,
-        generated_at,
-        bundle_path,
-        &files,
-    );
-
-    if let Err(error) = write_manifest(&bundle_root, &manifest) {
-        return failure_result_from_manifest(&mut manifest, error);
+    manifest.stage = ManifestStage::FileReview;
+    sync_manifest_files(&mut manifest, &files);
+    update_counts(&mut manifest);
+    if let Err(result) = persist_running_manifest(&bundle_root, &mut manifest) {
+        return result;
     }
 
-    if let Err(error) = fs::write(bundle_root.join("diff.patch"), &review_range.full_diff)
-        .map_err(|error| format!("failed writing diff.patch: {error}"))
+    if let Err(error) = fs::create_dir_all(bundle_root.join("files"))
+        .map_err(|error| format!("failed creating bundle files dir: {error}"))
+    {
+        return persist_failed_manifest(&bundle_root, &mut manifest, error);
+    }
+    if let Err(error) = fs::create_dir_all(bundle_root.join("agent"))
+        .map_err(|error| format!("failed creating bundle agent dir: {error}"))
     {
         return persist_failed_manifest(&bundle_root, &mut manifest, error);
     }
@@ -155,7 +221,7 @@ fn run_materialized(request: ReviewRequest, prepared: PreparedRun) -> RunResult 
         manifest.status = ManifestStatus::Failed;
         sync_manifest_files(&mut manifest, &files);
         update_counts(&mut manifest);
-        if let Err(write_error) = write_outputs(&bundle_root, &manifest, &[]) {
+        if let Err(write_error) = finalize_outputs(&bundle_root, &mut manifest, &[]) {
             return persist_failed_manifest(&bundle_root, &mut manifest, write_error);
         }
         return to_run_result(&manifest, Some(error));
@@ -256,7 +322,7 @@ fn run_materialized(request: ReviewRequest, prepared: PreparedRun) -> RunResult 
         ManifestStatus::Failed
     };
     update_counts(&mut manifest);
-    if let Err(error) = write_outputs(&bundle_root, &manifest, &findings) {
+    if let Err(error) = finalize_outputs(&bundle_root, &mut manifest, &findings) {
         return persist_failed_manifest(&bundle_root, &mut manifest, error);
     }
 
@@ -266,8 +332,6 @@ fn run_materialized(request: ReviewRequest, prepared: PreparedRun) -> RunResult 
 struct PreparedRun {
     repo_root: PathBuf,
     config: AppConfig,
-    review_range: git::ReviewRange,
-    diff_sections: Vec<String>,
     generated_at: String,
     review_id: String,
     relative_bundle_path: PathBuf,
@@ -276,12 +340,10 @@ struct PreparedRun {
 
 fn build_manifest(
     request: &ReviewRequest,
-    review_range: &git::ReviewRange,
     config: &AppConfig,
     review_id: String,
     generated_at: String,
     bundle_path: String,
-    files: &[ReviewFile],
 ) -> Manifest {
     let mut manifest = Manifest {
         review_id,
@@ -289,17 +351,19 @@ fn build_manifest(
         range: format!("{}...{}", request.base, request.head),
         base: request.base.clone(),
         head: request.head.clone(),
-        merge_base: review_range.merge_base.clone(),
+        stage: ManifestStage::Preflight,
+        preflight: PreflightManifest::default(),
+        merge_base: None,
         status: ManifestStatus::Running,
         bundle_path,
-        diff_patch: "diff.patch".to_string(),
+        diff_patch: None,
         comments_markdown: "comments.md".to_string(),
         comments_json: "comments.json".to_string(),
         runtime: RuntimeManifest {
             agent: config.agent.clone(),
             review: config.review.clone(),
         },
-        files: files.iter().map(FileRecord::from_review_file).collect(),
+        files: Vec::new(),
         counts: Counts::default(),
         errors: Vec::new(),
     };
@@ -321,6 +385,25 @@ fn post_materialization_failure(bundle_path: &str, error: String) -> RunResult {
 
 fn failure_result_from_manifest(manifest: &mut Manifest, error: String) -> RunResult {
     mark_manifest_failed(manifest, &error);
+    to_run_result(manifest, Some(error))
+}
+
+fn persist_running_manifest(bundle_root: &Path, manifest: &mut Manifest) -> Result<(), RunResult> {
+    write_manifest(bundle_root, manifest)
+        .map_err(|error| failure_result_from_manifest(manifest, error))
+}
+
+fn persist_preflight_failure(
+    bundle_root: &Path,
+    manifest: &mut Manifest,
+    error: String,
+) -> RunResult {
+    mark_manifest_failed(manifest, &error);
+    let error = match write_outputs(bundle_root, manifest, &[]) {
+        Ok(()) => error,
+        Err(write_error) if write_error == error => error,
+        Err(write_error) => format!("{error}; {write_error}"),
+    };
     to_run_result(manifest, Some(error))
 }
 
@@ -651,13 +734,12 @@ fn split_diff_sections(text: &str) -> Vec<String> {
     sections
 }
 
-fn build_review_id(timestamp: &str, base: &str, head: &str, short_merge_base: &str) -> String {
+fn build_review_id(timestamp: &str, base: &str, head: &str) -> String {
     format!(
-        "{}-{}...{}-{}",
+        "{}-{}...{}",
         timestamp.replace(':', "-"),
         slugify_text(base),
         slugify_text(head),
-        short_merge_base
     )
 }
 
@@ -791,6 +873,14 @@ fn write_outputs(
     findings: &[Finding],
 ) -> Result<(), String> {
     write_manifest(bundle_root, manifest)?;
+    write_comments_outputs(bundle_root, manifest, findings)
+}
+
+fn write_comments_outputs(
+    bundle_root: &Path,
+    manifest: &Manifest,
+    findings: &[Finding],
+) -> Result<(), String> {
     fs::write(
         bundle_root.join("comments.json"),
         JsonValue::Array(findings.iter().map(Finding::to_json).collect()).render_pretty(),
@@ -804,11 +894,69 @@ fn write_outputs(
     Ok(())
 }
 
+fn finalize_outputs(
+    bundle_root: &Path,
+    manifest: &mut Manifest,
+    findings: &[Finding],
+) -> Result<(), String> {
+    write_comments_outputs(bundle_root, manifest, findings)?;
+    manifest.stage = ManifestStage::Rendered;
+    write_manifest(bundle_root, manifest)
+}
+
 fn render_markdown(manifest: &Manifest, findings: &[Finding]) -> String {
+    if manifest.stage == ManifestStage::Preflight && manifest.status == ManifestStatus::Failed {
+        return render_preflight_failure_markdown(manifest);
+    }
+
+    render_file_review_markdown(manifest, findings)
+}
+
+fn render_preflight_failure_markdown(manifest: &Manifest) -> String {
     let mut text = String::new();
     text.push_str(&format!("# Review: {}\n\n", manifest.range));
     text.push_str(&format!("- Generated: {}\n", manifest.generated_at));
-    text.push_str(&format!("- Merge base: {}\n", manifest.merge_base));
+    text.push_str(&format!(
+        "- Repository opened: {}\n",
+        yes_no(manifest.preflight.repository_opened)
+    ));
+    text.push_str(&format!(
+        "- Base resolved: {}\n",
+        yes_no(manifest.preflight.base_resolved)
+    ));
+    text.push_str(&format!(
+        "- Head resolved: {}\n",
+        yes_no(manifest.preflight.head_resolved)
+    ));
+    text.push_str(&format!(
+        "- Merge base resolved: {}\n",
+        yes_no(manifest.preflight.merge_base_resolved)
+    ));
+    text.push_str(&format!(
+        "- Diff generated: {}\n\n",
+        yes_no(manifest.preflight.diff_generated)
+    ));
+
+    if let Some(error) = manifest.errors.last() {
+        text.push_str("## Failure\n\n");
+        text.push_str(error);
+        text.push_str("\n\n");
+    }
+
+    text.push_str(
+        "No file review occurred. comments.json is empty because Anne never reached file analysis.\n",
+    );
+    text
+}
+
+fn render_file_review_markdown(manifest: &Manifest, findings: &[Finding]) -> String {
+    let mut text = String::new();
+    text.push_str(&format!("# Review: {}\n\n", manifest.range));
+    text.push_str(&format!("- Generated: {}\n", manifest.generated_at));
+    text.push_str(&format!(
+        "- Merge base: {}\n",
+        manifest.merge_base.as_deref().unwrap_or("unresolved")
+    ));
     text.push_str(&format!(
         "- Files reviewed: {}\n",
         manifest.counts.files_reviewed
@@ -824,7 +972,10 @@ fn render_markdown(manifest: &Manifest, findings: &[Finding]) -> String {
         ));
     }
     text.push_str(&format!("- Findings: {}\n", manifest.counts.findings));
-    text.push_str(&format!("- Patch: {}\n\n", manifest.diff_patch));
+    text.push_str(&format!(
+        "- Patch: {}\n\n",
+        manifest.diff_patch.as_deref().unwrap_or("unavailable")
+    ));
 
     let mut findings_by_path: BTreeMap<&str, Vec<&Finding>> = BTreeMap::new();
     for finding in findings {
@@ -894,6 +1045,10 @@ fn render_markdown(manifest: &Manifest, findings: &[Finding]) -> String {
     }
 
     text
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value { "yes" } else { "no" }
 }
 
 fn sync_manifest_files(manifest: &mut Manifest, files: &[ReviewFile]) {
@@ -1140,6 +1295,59 @@ impl ManifestStatus {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManifestStage {
+    Preflight,
+    FileReview,
+    Rendered,
+}
+
+impl ManifestStage {
+    fn as_str(self) -> &'static str {
+        match self {
+            ManifestStage::Preflight => "preflight",
+            ManifestStage::FileReview => "file_review",
+            ManifestStage::Rendered => "rendered",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct PreflightManifest {
+    repository_opened: bool,
+    base_resolved: bool,
+    head_resolved: bool,
+    merge_base_resolved: bool,
+    diff_generated: bool,
+}
+
+impl PreflightManifest {
+    fn to_json(&self) -> JsonValue {
+        let mut object = BTreeMap::new();
+        object.insert(
+            "repository_opened".to_string(),
+            JsonValue::Bool(self.repository_opened),
+        );
+        object.insert(
+            "base_resolved".to_string(),
+            JsonValue::Bool(self.base_resolved),
+        );
+        object.insert(
+            "head_resolved".to_string(),
+            JsonValue::Bool(self.head_resolved),
+        );
+        object.insert(
+            "merge_base_resolved".to_string(),
+            JsonValue::Bool(self.merge_base_resolved),
+        );
+        object.insert(
+            "diff_generated".to_string(),
+            JsonValue::Bool(self.diff_generated),
+        );
+        JsonValue::Object(object)
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Manifest {
     review_id: String,
@@ -1147,10 +1355,12 @@ struct Manifest {
     range: String,
     base: String,
     head: String,
-    merge_base: String,
+    stage: ManifestStage,
+    preflight: PreflightManifest,
+    merge_base: Option<String>,
     status: ManifestStatus,
     bundle_path: String,
-    diff_patch: String,
+    diff_patch: Option<String>,
     comments_markdown: String,
     comments_json: String,
     runtime: RuntimeManifest,
@@ -1178,7 +1388,7 @@ impl Manifest {
         object.insert("counts".to_string(), self.counts.to_json());
         object.insert(
             "diff_patch".to_string(),
-            JsonValue::string(self.diff_patch.clone()),
+            optional_json_string(&self.diff_patch),
         );
         object.insert(
             "errors".to_string(),
@@ -1199,9 +1409,10 @@ impl Manifest {
             JsonValue::string(self.generated_at.clone()),
         );
         object.insert("head".to_string(), JsonValue::string(self.head.clone()));
+        object.insert("preflight".to_string(), self.preflight.to_json());
         object.insert(
             "merge_base".to_string(),
-            JsonValue::string(self.merge_base.clone()),
+            optional_json_string(&self.merge_base),
         );
         object.insert("range".to_string(), JsonValue::string(self.range.clone()));
         object.insert(
@@ -1209,6 +1420,7 @@ impl Manifest {
             JsonValue::string(self.review_id.clone()),
         );
         object.insert("runtime".to_string(), self.runtime.to_json());
+        object.insert("stage".to_string(), JsonValue::string(self.stage.as_str()));
         object.insert(
             "status".to_string(),
             JsonValue::string(self.status.as_str()),
@@ -1260,6 +1472,10 @@ impl RuntimeManifest {
         object.insert("review".to_string(), JsonValue::Object(review));
         JsonValue::Object(object)
     }
+}
+
+fn optional_json_string(value: &Option<String>) -> JsonValue {
+    value.clone().map_or(JsonValue::Null, JsonValue::string)
 }
 
 #[derive(Debug, Clone, Default)]

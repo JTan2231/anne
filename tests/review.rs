@@ -117,7 +117,7 @@ fn review_accepts_plain_agent_findings() {
 }
 
 #[test]
-fn review_bad_ref_fails_before_bundle_creation() {
+fn review_bad_ref_writes_preflight_failure_bundle() {
     let repo = TestRepo::new("bad-ref-preflight");
     init_repo(repo.path());
 
@@ -137,15 +137,97 @@ fn review_bad_ref_fails_before_bundle_creation() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(!stdout.contains("Review bundle:"));
+    assert!(stdout.contains("Review bundle:"));
     assert!(stderr.contains("failed resolving head ref `missing`"));
 
-    let reviews_root = repo.path().join(".anne").join("reviews");
-    let review_entries = fs::read_dir(&reviews_root)
-        .ok()
-        .map(|entries| entries.count())
-        .unwrap_or(0);
-    assert_eq!(review_entries, 0);
+    let bundle = bundle_path(repo.path(), &output.stdout);
+    let manifest = fs::read_to_string(bundle.join("manifest.json")).unwrap();
+    assert!(manifest.contains("\"stage\": \"preflight\""));
+    assert!(manifest.contains("\"repository_opened\": true"));
+    assert!(manifest.contains("\"base_resolved\": true"));
+    assert!(manifest.contains("\"head_resolved\": false"));
+    assert!(manifest.contains("\"merge_base\": null"));
+    assert!(manifest.contains("\"diff_patch\": null"));
+    assert!(manifest.contains("\"files\": []"));
+
+    let comments_json = fs::read_to_string(bundle.join("comments.json")).unwrap();
+    assert_eq!(comments_json.trim(), "[]");
+
+    let comments_md = fs::read_to_string(bundle.join("comments.md")).unwrap();
+    assert!(comments_md.contains("- Head resolved: no"));
+    assert!(comments_md.contains("No file review occurred."));
+    assert!(comments_md.contains("Anne never reached file analysis."));
+
+    assert!(!bundle.join("diff.patch").exists());
+    assert!(!bundle.join("files").exists());
+    assert!(!bundle.join("agent").exists());
+}
+
+#[test]
+fn review_merge_base_failure_writes_preflight_failure_bundle() {
+    let repo = TestRepo::new("merge-base-preflight");
+    init_repo(repo.path());
+
+    write_file(
+        &repo.path().join("src/lib.rs"),
+        "pub fn value() -> i32 {\n    1\n}\n",
+    );
+    commit_all(repo.path(), "initial");
+
+    write_file(
+        &repo.path().join("src/lib.rs"),
+        "pub fn value() -> i32 {\n    2\n}\n",
+    );
+    commit_all_without_parents_to_ref(repo.path(), "refs/heads/feature", "orphan feature");
+    checkout_branch(repo.path(), "main");
+
+    let output = anne(repo.path(), &["review", "main...feature"]);
+    assert!(
+        !output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stdout.contains("Review bundle:"));
+    assert!(stderr.contains("failed resolving merge base for `main` and `feature`"));
+
+    let bundle = bundle_path(repo.path(), &output.stdout);
+    let manifest = fs::read_to_string(bundle.join("manifest.json")).unwrap();
+    assert!(manifest.contains("\"stage\": \"preflight\""));
+    assert!(manifest.contains("\"base_resolved\": true"));
+    assert!(manifest.contains("\"head_resolved\": true"));
+    assert!(manifest.contains("\"merge_base_resolved\": false"));
+    assert!(manifest.contains("\"merge_base\": null"));
+    assert!(manifest.contains("\"diff_patch\": null"));
+
+    let comments_json = fs::read_to_string(bundle.join("comments.json")).unwrap();
+    assert_eq!(comments_json.trim(), "[]");
+
+    let comments_md = fs::read_to_string(bundle.join("comments.md")).unwrap();
+    assert!(comments_md.contains("- Merge base resolved: no"));
+    assert!(comments_md.contains("No file review occurred."));
+    assert!(!bundle.join("diff.patch").exists());
+}
+
+#[test]
+fn review_outside_repo_reports_no_bundle_path() {
+    let repo = TestRepo::new("outside-repo");
+
+    let output = anne(repo.path(), &["review", "main...feature"]);
+    assert!(
+        !output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stdout.contains("Review bundle:"));
+    assert!(stderr.contains("failed discovering repository"));
 }
 
 #[test]
@@ -888,17 +970,12 @@ fn fixed_date_script(path: &Path, timestamp: &str) -> PathBuf {
     script
 }
 
-fn review_bundle_id(repo: &Path, base: &str, head: &str, timestamp: &str) -> String {
-    let repo = open_repo(repo);
-    let base_oid = repo.revparse_single(base).unwrap().id();
-    let head_oid = repo.revparse_single(head).unwrap().id();
-    let merge_base = repo.merge_base(base_oid, head_oid).unwrap().to_string();
+fn review_bundle_id(_repo: &Path, base: &str, head: &str, timestamp: &str) -> String {
     format!(
-        "{}-{}...{}-{}",
+        "{}-{}...{}",
         timestamp.replace(':', "-"),
         slugify_for_review_id(base),
         slugify_for_review_id(head),
-        &merge_base[..7]
     )
 }
 
@@ -992,6 +1069,25 @@ fn commit_all(path: &Path, message: &str) {
         &parents,
     )
     .unwrap();
+}
+
+fn commit_all_without_parents_to_ref(path: &Path, reference: &str, message: &str) {
+    let repo = open_repo(path);
+    let removed_paths = collect_removed_paths(&repo);
+    let mut index = repo.index().unwrap();
+    index
+        .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
+        .unwrap();
+    for path in removed_paths {
+        index.remove_path(&path).unwrap();
+    }
+    index.write().unwrap();
+
+    let tree_id = index.write_tree().unwrap();
+    let tree = repo.find_tree(tree_id).unwrap();
+    let signature = repo.signature().unwrap();
+    repo.commit(Some(reference), &signature, &signature, message, &tree, &[])
+        .unwrap();
 }
 
 fn collect_removed_paths(repo: &Repository) -> Vec<PathBuf> {
