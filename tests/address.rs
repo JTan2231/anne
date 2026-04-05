@@ -256,6 +256,94 @@ EOF
 }
 
 #[test]
+fn address_prefers_canonical_review_and_writes_canonical_bundle_timestamp_without_date() {
+    let repo = TestRepo::new("canonical-review-selection");
+    init_repo(repo.path());
+    write_init_template(repo.path());
+
+    let agent = agent_script(
+        repo.path(),
+        r#"while IFS= read -r _line; do :; done
+printf '%s\n' \
+  '# Anne' \
+  '' \
+  '## Feature: Canonical timestamp selection' \
+  '' \
+  '### Problem' \
+  '' \
+  'Legacy review timestamps should not outrank canonical ones.' \
+  '' \
+  '### Goals' \
+  '' \
+  '- Select the newest canonical review bundle.' \
+  '' \
+  '### Non-Goals' \
+  '' \
+  '- Rewriting historical review manifests.' \
+  '' \
+  '## Proposed Approach' \
+  '' \
+  'Prefer canonical `generated_at` values and keep address bundle ids canonical too.'
+"#,
+    );
+    write_agent_config(repo.path(), "text", &agent, None);
+
+    write_review_bundle(
+        repo.path(),
+        "2026-04-04T12-00-00Z-legacy",
+        Some("unix-9999999999"),
+        &[ReviewCommentSpec {
+            id: "R001",
+            path: "src/legacy.rs",
+            side: "new",
+            line: 2,
+            severity: "warning",
+            title: "Legacy timestamp",
+            body: "Legacy bundle should not win.",
+            hunk_header: Some("@@ -1,1 +1,2 @@"),
+            patch_file: Some("files/0001-src-legacy.rs.patch"),
+        }],
+    );
+    write_review_bundle(
+        repo.path(),
+        "2026-04-04T11-00-00Z-canonical",
+        Some("2026-04-04T11:00:00Z"),
+        &[ReviewCommentSpec {
+            id: "R001",
+            path: "src/canonical.rs",
+            side: "new",
+            line: 2,
+            severity: "warning",
+            title: "Canonical timestamp",
+            body: "Canonical bundle should win.",
+            hunk_header: Some("@@ -1,1 +1,2 @@"),
+            patch_file: Some("files/0001-src-canonical.rs.patch"),
+        }],
+    );
+
+    let output = anne_with_path(repo.path(), &["address", "R001"], Some(""));
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let bundle = address_bundle_path(repo.path(), &output.stdout);
+    let manifest = fs::read_to_string(bundle.join("manifest.json")).unwrap();
+    assert!(manifest.contains("\"review_id\": \"2026-04-04T11-00-00Z-canonical\""));
+
+    let generated_at = json_string_field(&manifest, "generated_at");
+    assert_canonical_timestamp(&generated_at);
+    assert!(!generated_at.starts_with("unix-"));
+
+    assert_eq!(
+        bundle.file_name().unwrap().to_string_lossy(),
+        address_bundle_id(&generated_at, "R001")
+    );
+}
+
+#[test]
 fn address_prefers_newest_completed_review_over_newer_running_bundle() {
     let repo = TestRepo::new("completed-over-running");
     init_repo(repo.path());
@@ -311,8 +399,8 @@ EOF
         Some("2026-04-04T11:00:00Z"),
         &[],
     );
-    let running_manifest_path = review_bundle_path(repo.path(), "2026-04-04T11-00-00Z-running")
-        .join("manifest.json");
+    let running_manifest_path =
+        review_bundle_path(repo.path(), "2026-04-04T11-00-00Z-running").join("manifest.json");
     let running_manifest = fs::read_to_string(&running_manifest_path).unwrap();
     write_file(
         &running_manifest_path,
@@ -347,8 +435,8 @@ fn address_falls_back_to_running_bundle_when_no_completed_review_is_usable() {
         Some("2026-04-04T11:30:00Z"),
         &[],
     );
-    let manifest_path = review_bundle_path(repo.path(), "2026-04-04T11-30-00Z-running-only")
-        .join("manifest.json");
+    let manifest_path =
+        review_bundle_path(repo.path(), "2026-04-04T11-30-00Z-running-only").join("manifest.json");
     let manifest = fs::read_to_string(&manifest_path).unwrap();
     write_file(
         &manifest_path,
@@ -438,7 +526,8 @@ EOF
             patch_file: Some("files/0001-src-newer.rs.patch"),
         }],
     );
-    let manifest_only_bundle = review_bundle_path(repo.path(), "2026-04-04T11-00-00Z-newer-manifest-only");
+    let manifest_only_bundle =
+        review_bundle_path(repo.path(), "2026-04-04T11-00-00Z-newer-manifest-only");
     fs::remove_file(manifest_only_bundle.join("diff.patch")).unwrap();
     fs::remove_file(manifest_only_bundle.join("comments.json")).unwrap();
     fs::remove_file(manifest_only_bundle.join("comments.md")).unwrap();
@@ -1795,6 +1884,30 @@ fn slugify_for_address_id(text: &str) -> String {
         "file".to_string()
     } else {
         output
+    }
+}
+
+fn json_string_field(text: &str, field: &str) -> String {
+    let prefix = format!("\"{field}\": \"");
+    let start = text.find(&prefix).unwrap() + prefix.len();
+    let value = &text[start..];
+    value[..value.find('"').unwrap()].to_string()
+}
+
+fn assert_canonical_timestamp(timestamp: &str) {
+    let bytes = timestamp.as_bytes();
+    assert_eq!(bytes.len(), 20, "unexpected timestamp length: {timestamp}");
+    assert_eq!(bytes[4], b'-', "unexpected timestamp shape: {timestamp}");
+    assert_eq!(bytes[7], b'-', "unexpected timestamp shape: {timestamp}");
+    assert_eq!(bytes[10], b'T', "unexpected timestamp shape: {timestamp}");
+    assert_eq!(bytes[13], b':', "unexpected timestamp shape: {timestamp}");
+    assert_eq!(bytes[16], b':', "unexpected timestamp shape: {timestamp}");
+    assert_eq!(bytes[19], b'Z', "unexpected timestamp shape: {timestamp}");
+    for index in [0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18] {
+        assert!(
+            bytes[index].is_ascii_digit(),
+            "unexpected timestamp shape: {timestamp}"
+        );
     }
 }
 

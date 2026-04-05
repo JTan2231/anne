@@ -68,6 +68,53 @@ fn review_uses_merge_base_semantics_and_records_skips() {
 }
 
 #[test]
+fn review_uses_canonical_timestamp_without_date_on_path() {
+    let repo = TestRepo::new("canonical-fallback-timestamp");
+    init_repo(repo.path());
+
+    write_file(
+        &repo.path().join("src/lib.rs"),
+        "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n",
+    );
+    commit_all(repo.path(), "initial");
+
+    create_and_checkout_branch(repo.path(), "feature");
+    write_file(
+        &repo.path().join("src/lib.rs"),
+        "pub fn add(a: i32, b: i32) -> i32 {\n    a + b + 1\n}\n",
+    );
+    commit_all(repo.path(), "feature changes");
+
+    checkout_branch(repo.path(), "main");
+
+    let agent = agent_script(
+        repo.path(),
+        "while IFS= read -r _line; do :; done\nprintf '[]\\n'\n",
+    );
+    write_agent_config(repo.path(), "text", &agent, None);
+
+    let output = anne_with_path(repo.path(), &["review", "main...feature"], Some(""));
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let bundle = bundle_path(repo.path(), &output.stdout);
+    let manifest = fs::read_to_string(bundle.join("manifest.json")).unwrap();
+    let generated_at = json_string_field(&manifest, "generated_at");
+    assert_canonical_timestamp(&generated_at);
+    assert!(!generated_at.starts_with("unix-"));
+
+    let expected_review_id = review_bundle_id(repo.path(), "main", "feature", &generated_at);
+    assert_eq!(
+        bundle.file_name().unwrap().to_string_lossy(),
+        expected_review_id
+    );
+}
+
+#[test]
 fn review_accepts_plain_agent_findings() {
     let repo = TestRepo::new("plain-agent");
     init_repo(repo.path());
@@ -651,16 +698,13 @@ esac
     ));
     let child = spawn_anne_with_path(repo.path(), &["review", "main...feature"], Some(&path_env));
 
-    wait_for(
-        "running snapshot publication",
-        || {
-            repo.path().join(".anne-test/a-started").exists()
-                && repo.path().join(".anne-test/b-finished").exists()
-                && bundle.join("manifest.json").is_file()
-                && bundle.join("comments.json").is_file()
-                && bundle.join("comments.md").exists()
-        },
-    );
+    wait_for("running snapshot publication", || {
+        repo.path().join(".anne-test/a-started").exists()
+            && repo.path().join(".anne-test/b-finished").exists()
+            && bundle.join("manifest.json").is_file()
+            && bundle.join("comments.json").is_file()
+            && bundle.join("comments.md").exists()
+    });
 
     let manifest = fs::read_to_string(bundle.join("manifest.json")).unwrap();
     assert!(manifest.contains("\"status\": \"running\""));
@@ -1814,6 +1858,30 @@ fn slugify_for_review_id(text: &str) -> String {
         "file".to_string()
     } else {
         output
+    }
+}
+
+fn json_string_field(text: &str, field: &str) -> String {
+    let prefix = format!("\"{field}\": \"");
+    let start = text.find(&prefix).unwrap() + prefix.len();
+    let value = &text[start..];
+    value[..value.find('"').unwrap()].to_string()
+}
+
+fn assert_canonical_timestamp(timestamp: &str) {
+    let bytes = timestamp.as_bytes();
+    assert_eq!(bytes.len(), 20, "unexpected timestamp length: {timestamp}");
+    assert_eq!(bytes[4], b'-', "unexpected timestamp shape: {timestamp}");
+    assert_eq!(bytes[7], b'-', "unexpected timestamp shape: {timestamp}");
+    assert_eq!(bytes[10], b'T', "unexpected timestamp shape: {timestamp}");
+    assert_eq!(bytes[13], b':', "unexpected timestamp shape: {timestamp}");
+    assert_eq!(bytes[16], b':', "unexpected timestamp shape: {timestamp}");
+    assert_eq!(bytes[19], b'Z', "unexpected timestamp shape: {timestamp}");
+    for index in [0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18] {
+        assert!(
+            bytes[index].is_ascii_digit(),
+            "unexpected timestamp shape: {timestamp}"
+        );
     }
 }
 

@@ -11,7 +11,7 @@ use crate::{
     config::{AgentConfig, AppConfig},
     git,
     json::{self, JsonValue},
-    util::{current_timestamp, slugify_text, string_array},
+    util::{current_timestamp, is_canonical_timestamp, slugify_text, string_array},
 };
 
 pub struct RunResult {
@@ -405,10 +405,16 @@ fn no_usable_review_bundle_error(skipped: &[SkippedReviewCandidate]) -> String {
 
 fn sort_review_candidates(candidates: &mut [ReviewCandidate]) {
     candidates.sort_by(|left, right| {
-        left.generated_at()
-            .cmp(&right.generated_at())
+        sortable_generated_at(left)
+            .cmp(&sortable_generated_at(right))
             .then(left.review_id.cmp(&right.review_id))
     });
+}
+
+fn sortable_generated_at(candidate: &ReviewCandidate) -> Option<&str> {
+    candidate
+        .generated_at()
+        .and_then(|timestamp| is_canonical_timestamp(timestamp).then_some(timestamp.as_str()))
 }
 
 fn load_review_context(candidate: &ReviewCandidate) -> Result<ReviewContext, String> {
@@ -430,13 +436,18 @@ fn load_review_context(candidate: &ReviewCandidate) -> Result<ReviewContext, Str
         .comments_json
         .as_deref()
         .ok_or_else(|| "manifest.json did not advertise comments.json".to_string())?;
-    let comments_text = read_bundle_artifact(&candidate.bundle_root, comments_json, "comments.json")?;
+    let comments_text =
+        read_bundle_artifact(&candidate.bundle_root, comments_json, "comments.json")?;
     let comments = parse_comments(&comments_text)
         .map_err(|error| format!("comments.json was not valid: {error}"))?;
     Ok(candidate.review_context(comments))
 }
 
-fn read_bundle_artifact(bundle_root: &Path, relative_path: &str, label: &str) -> Result<String, String> {
+fn read_bundle_artifact(
+    bundle_root: &Path,
+    relative_path: &str,
+    label: &str,
+) -> Result<String, String> {
     fs::read_to_string(bundle_root.join(relative_path))
         .map_err(|error| format!("{label} was not readable: {error}"))
 }
@@ -1562,32 +1573,8 @@ mod tests {
     #[test]
     fn review_candidates_prefer_timestamp_then_review_id() {
         let mut candidates = [
-            ReviewCandidate {
-                review_id: "2026-04-04T01-00-00Z-a".to_string(),
-                bundle_root: PathBuf::from("a"),
-                manifest: Some(ReviewManifest {
-                    generated_at: Some("2026-04-04T01:00:00Z".to_string()),
-                    range: None,
-                    merge_base: None,
-                    status: None,
-                    diff_patch: None,
-                    comments_json: None,
-                    comments_markdown: None,
-                }),
-            },
-            ReviewCandidate {
-                review_id: "2026-04-04T01-00-00Z-b".to_string(),
-                bundle_root: PathBuf::from("b"),
-                manifest: Some(ReviewManifest {
-                    generated_at: Some("2026-04-04T01:00:00Z".to_string()),
-                    range: None,
-                    merge_base: None,
-                    status: None,
-                    diff_patch: None,
-                    comments_json: None,
-                    comments_markdown: None,
-                }),
-            },
+            review_candidate("2026-04-04T01-00-00Z-a", Some("2026-04-04T01:00:00Z")),
+            review_candidate("2026-04-04T01-00-00Z-b", Some("2026-04-04T01:00:00Z")),
         ];
 
         sort_review_candidates(&mut candidates);
@@ -1595,6 +1582,39 @@ mod tests {
         assert_eq!(
             candidates.last().unwrap().review_id,
             "2026-04-04T01-00-00Z-b"
+        );
+    }
+
+    #[test]
+    fn review_candidates_prefer_canonical_timestamps_over_legacy_values() {
+        let mut candidates = [
+            review_candidate("2026-04-04T10-00-00Z-legacy", Some("unix-9999999999")),
+            review_candidate(
+                "2026-04-04T09-00-00Z-canonical",
+                Some("2026-04-04T09:00:00Z"),
+            ),
+        ];
+
+        sort_review_candidates(&mut candidates);
+
+        assert_eq!(
+            candidates.last().unwrap().review_id,
+            "2026-04-04T09-00-00Z-canonical"
+        );
+    }
+
+    #[test]
+    fn review_candidates_with_missing_timestamps_fall_back_to_review_id() {
+        let mut candidates = [
+            review_candidate("2026-04-04T10-00-00Z-alpha", None),
+            review_candidate("2026-04-04T10-00-00Z-zeta", None),
+        ];
+
+        sort_review_candidates(&mut candidates);
+
+        assert_eq!(
+            candidates.last().unwrap().review_id,
+            "2026-04-04T10-00-00Z-zeta"
         );
     }
 
@@ -1647,6 +1667,22 @@ mod tests {
 
     fn create_existing_address_bundle(repo_root: &Path, address_id: &str) {
         fs::create_dir_all(repo_root.join(".anne").join("address").join(address_id)).unwrap();
+    }
+
+    fn review_candidate(review_id: &str, generated_at: Option<&str>) -> ReviewCandidate {
+        ReviewCandidate {
+            review_id: review_id.to_string(),
+            bundle_root: PathBuf::from(review_id),
+            manifest: Some(ReviewManifest {
+                generated_at: generated_at.map(ToString::to_string),
+                range: None,
+                merge_base: None,
+                status: None,
+                diff_patch: None,
+                comments_json: None,
+                comments_markdown: None,
+            }),
+        }
     }
 
     struct TestDir {
