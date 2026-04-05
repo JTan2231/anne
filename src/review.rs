@@ -141,21 +141,7 @@ fn run_materialized(request: ReviewRequest, prepared: PreparedRun) -> RunResult 
         return result;
     }
 
-    let diff_sections = split_diff_sections(&review_range.full_diff);
-    if diff_sections.len() != review_range.changes.len() {
-        manifest.stage = ManifestStage::FileReview;
-        return persist_failed_manifest(
-            &bundle_root,
-            &mut manifest,
-            format!(
-                "diff generation returned {} file sections but change enumeration returned {} entries",
-                diff_sections.len(),
-                review_range.changes.len()
-            ),
-        );
-    }
-
-    let mut files = match build_files(&review_range.changes, &diff_sections, &config) {
+    let mut files = match build_files(&review_range.changes, &config) {
         Ok(files) => files,
         Err(error) => {
             manifest.stage = ManifestStage::FileReview;
@@ -623,29 +609,21 @@ Patch:
     )
 }
 
-fn build_files(
-    changes: &[ChangeRecord],
-    diff_sections: &[String],
-    config: &AppConfig,
-) -> Result<Vec<ReviewFile>, String> {
+fn build_files(changes: &[ChangeRecord], config: &AppConfig) -> Result<Vec<ReviewFile>, String> {
     let mut files = changes
         .iter()
-        .zip(diff_sections)
-        .map(|(change, patch)| build_file(change, patch, config))
+        .map(|change| build_file(change, config))
         .collect::<Result<Vec<_>, _>>()?;
     files.sort_by(|left, right| left.display_path.cmp(&right.display_path));
     Ok(files)
 }
 
-fn build_file(
-    change: &ChangeRecord,
-    patch_text: &str,
-    config: &AppConfig,
-) -> Result<ReviewFile, String> {
+fn build_file(change: &ChangeRecord, config: &AppConfig) -> Result<ReviewFile, String> {
     let display_path = change.display_path().to_string();
-    let anchors = parse_anchors(patch_text)?;
+    let anchors = parse_anchors(&change.patch_text)?;
     let has_hunks = !anchors.headers.is_empty();
-    let is_binary = patch_text.contains("GIT binary patch") || patch_text.contains("Binary files ");
+    let is_binary = change.patch_text.contains("GIT binary patch")
+        || change.patch_text.contains("Binary files ");
     let rename_only = change.status.starts_with('R') && !has_hunks && !is_binary;
 
     let (status, skip_reason) = if config.review.ignores(&display_path) {
@@ -655,6 +633,8 @@ fn build_file(
                 "ignored by review.ignore_prefixes ({display_path})"
             )),
         )
+    } else if let Some(skip_reason) = &change.skip_reason_hint {
+        (FileStatus::Skipped, Some(skip_reason.clone()))
     } else if is_binary {
         (FileStatus::Skipped, Some("binary diff".to_string()))
     } else if rename_only {
@@ -667,7 +647,7 @@ fn build_file(
             FileStatus::Skipped,
             Some("metadata-only change without textual diff".to_string()),
         )
-    } else if patch_text.as_bytes().len() > config.review.max_patch_bytes {
+    } else if change.patch_text.as_bytes().len() > config.review.max_patch_bytes {
         (
             FileStatus::Skipped,
             Some(format!(
@@ -683,7 +663,7 @@ fn build_file(
         display_path,
         old_path: change.old_path.clone(),
         new_path: change.new_path.clone(),
-        patch_text: patch_text.to_string(),
+        patch_text: change.patch_text.clone(),
         status,
         skip_reason,
         patch_file: None,
@@ -723,29 +703,6 @@ fn agent_artifact_paths(file: &ReviewFile) -> (String, String) {
         format!("agent/{stem}.prompt.md"),
         format!("agent/{stem}.response.txt"),
     )
-}
-
-fn split_diff_sections(text: &str) -> Vec<String> {
-    let mut sections = Vec::new();
-    let mut current = Vec::new();
-
-    for line in text.lines() {
-        if line.starts_with("diff --git ") {
-            if !current.is_empty() {
-                sections.push(current.join("\n") + "\n");
-                current.clear();
-            }
-        }
-        if line.starts_with("diff --git ") || !current.is_empty() {
-            current.push(line.to_string());
-        }
-    }
-
-    if !current.is_empty() {
-        sections.push(current.join("\n") + "\n");
-    }
-
-    sections
 }
 
 fn build_review_id(timestamp: &str, base: &str, head: &str) -> String {
@@ -1709,13 +1666,15 @@ index 1111111..2222222 100644
                 status: "R100".to_string(),
                 old_path: Some("src/old.rs".to_string()),
                 new_path: Some("src/new.rs".to_string()),
-            },
-            "\
+                patch_text: "\
 diff --git a/src/old.rs b/src/new.rs
 similarity index 100%
 rename from src/old.rs
 rename to src/new.rs
-",
+"
+                .to_string(),
+                skip_reason_hint: None,
+            },
             &config,
         )
         .unwrap();
@@ -1724,6 +1683,73 @@ rename to src/new.rs
         assert_eq!(
             file.skip_reason.as_deref(),
             Some("pure rename without textual changes")
+        );
+    }
+
+    #[test]
+    fn expanded_typechange_patches_queue_one_review_file_with_old_and_new_anchors() {
+        let config = AppConfig::default();
+        let file = build_file(
+            &ChangeRecord {
+                status: "T".to_string(),
+                old_path: Some("src/link".to_string()),
+                new_path: Some("src/link".to_string()),
+                patch_text: "\
+diff --git a/src/link b/src/link
+deleted file mode 100644
+index 1111111..0000000
+--- a/src/link
++++ /dev/null
+@@ -1,2 +0,0 @@
+-line1
+-line2
+diff --git a/src/link b/src/link
+new file mode 120000
+index 0000000..2222222
+--- /dev/null
++++ b/src/link
+@@ -0,0 +1,1 @@
++target/path
+\\ No newline at end of file
+"
+                .to_string(),
+                skip_reason_hint: None,
+            },
+            &config,
+        )
+        .unwrap();
+
+        assert_eq!(file.status, FileStatus::Queued);
+        assert!(file.skip_reason.is_none());
+        assert!(file.anchors.changed_old.contains(&1));
+        assert!(file.anchors.changed_old.contains(&2));
+        assert!(file.anchors.changed_new.contains(&1));
+    }
+
+    #[test]
+    fn explicit_skip_reason_hint_beats_metadata_only_fallback() {
+        let config = AppConfig::default();
+        let file = build_file(
+            &ChangeRecord {
+                status: "T".to_string(),
+                old_path: Some("src/blob.bin".to_string()),
+                new_path: Some("src/blob.bin".to_string()),
+                patch_text: "\
+diff --git a/src/blob.bin b/src/blob.bin
+old mode 100644
+new mode 120000
+"
+                .to_string(),
+                skip_reason_hint: Some("binary file/symlink typechange".to_string()),
+            },
+            &config,
+        )
+        .unwrap();
+
+        assert_eq!(file.status, FileStatus::Skipped);
+        assert_eq!(
+            file.skip_reason.as_deref(),
+            Some("binary file/symlink typechange")
         );
     }
 

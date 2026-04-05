@@ -1017,6 +1017,250 @@ fn review_skips_pure_renames_from_git2_diff_data() {
     assert!(comments_md.contains("src/new.rs: pure rename without textual changes"));
 }
 
+#[cfg(unix)]
+#[test]
+fn review_expands_file_to_symlink_typechanges_into_one_reviewed_file() {
+    let repo = TestRepo::new("file-to-symlink");
+    init_repo(repo.path());
+
+    write_file(&repo.path().join("target/path"), "target file\n");
+    write_file(&repo.path().join("src/link"), "line1\nline2\n");
+    commit_all(repo.path(), "initial");
+
+    create_and_checkout_branch(repo.path(), "feature");
+    fs::remove_file(repo.path().join("src/link")).unwrap();
+    write_symlink("target/path", &repo.path().join("src/link"));
+    commit_all(repo.path(), "convert to symlink");
+
+    fs::remove_file(repo.path().join("src/link")).unwrap();
+    checkout_branch(repo.path(), "main");
+    write_agent_config(
+        repo.path(),
+        "text",
+        &agent_script(
+            repo.path(),
+            "while IFS= read -r _line; do :; done\nprintf '[]\\n'\n",
+        ),
+        None,
+    );
+
+    let output = anne(repo.path(), &["review", "main...feature"]);
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let bundle = bundle_path(repo.path(), &output.stdout);
+    let diff = fs::read_to_string(bundle.join("diff.patch")).unwrap();
+    let file_patch = fs::read_to_string(bundle.join("files/0001-src-link.patch")).unwrap();
+    assert_eq!(diff, file_patch);
+    assert!(diff.contains("deleted file mode 100644"));
+    assert!(diff.contains("new file mode 120000"));
+    assert!(diff.contains("@@ -1,2 +0,0 @@"));
+    assert!(diff.contains("@@ -0,0 +1,1 @@"));
+    assert!(diff.contains("-line1"));
+    assert!(diff.contains("-line2"));
+    assert!(diff.contains("+target/path"));
+
+    let manifest = fs::read_to_string(bundle.join("manifest.json")).unwrap();
+    assert!(manifest.contains("\"patch_file\": \"files/0001-src-link.patch\""));
+    assert!(!manifest.contains("metadata-only change without textual diff"));
+
+    let comments_md = fs::read_to_string(bundle.join("comments.md")).unwrap();
+    assert_eq!(comments_md.matches("## src/link\n").count(), 1);
+    assert!(comments_md.contains("No findings."));
+    assert!(!comments_md.contains("## Skipped Files"));
+}
+
+#[cfg(unix)]
+#[test]
+fn review_expands_symlink_to_file_typechanges_into_one_reviewed_file() {
+    let repo = TestRepo::new("symlink-to-file");
+    init_repo(repo.path());
+
+    write_file(&repo.path().join("target/path"), "target file\n");
+    write_symlink("target/path", &repo.path().join("src/link"));
+    commit_all(repo.path(), "initial");
+
+    create_and_checkout_branch(repo.path(), "feature");
+    fs::remove_file(repo.path().join("src/link")).unwrap();
+    write_file(&repo.path().join("src/link"), "line1\nline2\n");
+    commit_all(repo.path(), "convert to file");
+
+    checkout_branch(repo.path(), "main");
+    write_agent_config(
+        repo.path(),
+        "text",
+        &agent_script(
+            repo.path(),
+            "while IFS= read -r _line; do :; done\nprintf '[]\\n'\n",
+        ),
+        None,
+    );
+
+    let output = anne(repo.path(), &["review", "main...feature"]);
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let bundle = bundle_path(repo.path(), &output.stdout);
+    let diff = fs::read_to_string(bundle.join("diff.patch")).unwrap();
+    let file_patch = fs::read_to_string(bundle.join("files/0001-src-link.patch")).unwrap();
+    assert_eq!(diff, file_patch);
+    assert!(diff.contains("deleted file mode 120000"));
+    assert!(diff.contains("new file mode 100644"));
+    assert!(diff.contains("@@ -1,1 +0,0 @@"));
+    assert!(diff.contains("@@ -0,0 +1,2 @@"));
+    assert!(diff.contains("-target/path"));
+    assert!(diff.contains("+line1"));
+    assert!(diff.contains("+line2"));
+
+    let comments_md = fs::read_to_string(bundle.join("comments.md")).unwrap();
+    assert_eq!(comments_md.matches("## src/link\n").count(), 1);
+    assert!(comments_md.contains("No findings."));
+    assert!(!comments_md.contains("## Skipped Files"));
+}
+
+#[cfg(unix)]
+#[test]
+fn review_keeps_symlink_target_edits_as_modified_file_reviews() {
+    let repo = TestRepo::new("symlink-target-edit");
+    init_repo(repo.path());
+
+    write_file(&repo.path().join("old/target"), "old target\n");
+    write_file(&repo.path().join("new/target"), "new target\n");
+    write_symlink("old/target", &repo.path().join("src/link"));
+    commit_all(repo.path(), "initial");
+
+    create_and_checkout_branch(repo.path(), "feature");
+    fs::remove_file(repo.path().join("src/link")).unwrap();
+    write_symlink("new/target", &repo.path().join("src/link"));
+    commit_all(repo.path(), "change target");
+
+    checkout_branch(repo.path(), "main");
+    write_agent_config(
+        repo.path(),
+        "text",
+        &agent_script(
+            repo.path(),
+            "while IFS= read -r _line; do :; done\nprintf '[]\\n'\n",
+        ),
+        None,
+    );
+
+    let output = anne(repo.path(), &["review", "main...feature"]);
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let bundle = bundle_path(repo.path(), &output.stdout);
+    let diff = fs::read_to_string(bundle.join("diff.patch")).unwrap();
+    assert!(diff.contains("index"));
+    assert!(diff.contains("120000"));
+    assert!(diff.contains("@@ -1 +1 @@"));
+    assert!(diff.contains("-old/target"));
+    assert!(diff.contains("+new/target"));
+    assert!(!diff.contains("deleted file mode"));
+    assert!(!diff.contains("new file mode"));
+
+    let comments_md = fs::read_to_string(bundle.join("comments.md")).unwrap();
+    assert!(comments_md.contains("## src/link"));
+    assert!(comments_md.contains("No findings."));
+}
+
+#[cfg(unix)]
+#[test]
+fn review_keeps_permission_only_mode_changes_as_metadata_only_skips() {
+    let repo = TestRepo::new("permission-only");
+    init_repo(repo.path());
+
+    write_file(&repo.path().join("src/tool"), "echo hi\n");
+    commit_all(repo.path(), "initial");
+
+    create_and_checkout_branch(repo.path(), "feature");
+    set_mode(&repo.path().join("src/tool"), 0o755);
+    commit_all(repo.path(), "make executable");
+
+    checkout_branch(repo.path(), "main");
+    write_agent_config(
+        repo.path(),
+        "text",
+        &agent_script(
+            repo.path(),
+            "while IFS= read -r _line; do :; done\nprintf '[]\\n'\n",
+        ),
+        None,
+    );
+
+    let output = anne(repo.path(), &["review", "main...feature"]);
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let bundle = bundle_path(repo.path(), &output.stdout);
+    let diff = fs::read_to_string(bundle.join("diff.patch")).unwrap();
+    assert!(diff.contains("old mode 100644"));
+    assert!(diff.contains("new mode 100755"));
+    assert!(!bundle.join("files/0001-src-tool.patch").exists());
+
+    let comments_md = fs::read_to_string(bundle.join("comments.md")).unwrap();
+    assert!(comments_md.contains("## Skipped Files"));
+    assert!(comments_md.contains("src/tool: metadata-only change without textual diff"));
+}
+
+#[cfg(unix)]
+#[test]
+fn review_skips_binary_file_to_symlink_typechanges_with_explicit_reason() {
+    let repo = TestRepo::new("binary-to-symlink");
+    init_repo(repo.path());
+
+    write_file(&repo.path().join("target/path"), "target file\n");
+    write_bytes(&repo.path().join("src/blob.bin"), b"\x00\x01\x02binary");
+    commit_all(repo.path(), "initial");
+
+    create_and_checkout_branch(repo.path(), "feature");
+    fs::remove_file(repo.path().join("src/blob.bin")).unwrap();
+    write_symlink("target/path", &repo.path().join("src/blob.bin"));
+    commit_all(repo.path(), "convert binary to symlink");
+
+    fs::remove_file(repo.path().join("src/blob.bin")).unwrap();
+    checkout_branch(repo.path(), "main");
+    write_agent_config(
+        repo.path(),
+        "text",
+        &agent_script(
+            repo.path(),
+            "while IFS= read -r _line; do :; done\nprintf '[]\\n'\n",
+        ),
+        None,
+    );
+
+    let output = anne(repo.path(), &["review", "main...feature"]);
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let bundle = bundle_path(repo.path(), &output.stdout);
+    let comments_md = fs::read_to_string(bundle.join("comments.md")).unwrap();
+    assert!(comments_md.contains("src/blob.bin: binary file/symlink typechange"));
+    assert!(!comments_md.contains("src/blob.bin: metadata-only change without textual diff"));
+    assert!(!bundle.join("files/0001-src-blob.bin.patch").exists());
+}
+
 #[test]
 fn default_filter_surfaces_nested_turn_failed_message() {
     let repo = TestRepo::new("default-filter-turn-failed");
@@ -1646,10 +1890,33 @@ fn tracked_git_cli_guard_path(path: &Path) -> bool {
 }
 
 fn write_file(path: &Path, contents: &str) {
+    write_bytes(path, contents.as_bytes());
+}
+
+fn write_bytes(path: &Path, contents: &[u8]) {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).unwrap();
     }
     fs::write(path, contents).unwrap();
+}
+
+#[cfg(unix)]
+fn write_symlink(target: &str, path: &Path) {
+    use std::os::unix::fs::symlink;
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).unwrap();
+    }
+    symlink(target, path).unwrap();
+}
+
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut perms = fs::metadata(path).unwrap().permissions();
+    perms.set_mode(mode);
+    fs::set_permissions(path, perms).unwrap();
 }
 
 fn write_executable(path: &Path, contents: &str) {
