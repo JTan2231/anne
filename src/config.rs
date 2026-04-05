@@ -32,7 +32,9 @@ impl AppConfig {
 pub struct AgentConfig {
     pub label: String,
     pub command: Vec<String>,
+    pub command_source: AgentSettingSource,
     pub progress_filter: Vec<String>,
+    pub progress_filter_source: AgentSettingSource,
     pub output: AgentOutput,
     pub enable_script_wrapper: bool,
     pub workers: usize,
@@ -43,10 +45,30 @@ impl Default for AgentConfig {
         Self {
             label: "default".to_string(),
             command: Vec::new(),
+            command_source: AgentSettingSource::None,
             progress_filter: Vec::new(),
+            progress_filter_source: AgentSettingSource::None,
             output: AgentOutput::default(),
             enable_script_wrapper: false,
             workers: 4,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AgentSettingSource {
+    #[default]
+    None,
+    Explicit,
+    BundledDefault,
+}
+
+impl AgentSettingSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AgentSettingSource::None => "none",
+            AgentSettingSource::Explicit => "explicit",
+            AgentSettingSource::BundledDefault => "bundled-default",
         }
     }
 }
@@ -76,17 +98,27 @@ impl AgentConfig {
             && let Some(path) = bundled_agent_command(&label)
         {
             self.command = vec![path.display().to_string()];
+            self.command_source = AgentSettingSource::BundledDefault;
+        } else if !self.command.is_empty() && self.command_source == AgentSettingSource::None {
+            self.command_source = AgentSettingSource::Explicit;
         }
 
         if self.progress_filter.is_empty()
+            && self.progress_filter_source != AgentSettingSource::Explicit
+            && self.command_source == AgentSettingSource::BundledDefault
             && let Some(path) = bundled_progress_filter(&label)
         {
             self.progress_filter = vec![path.display().to_string()];
+            self.progress_filter_source = AgentSettingSource::BundledDefault;
+        } else if !self.progress_filter.is_empty()
+            && self.progress_filter_source == AgentSettingSource::None
+        {
+            self.progress_filter_source = AgentSettingSource::Explicit;
         }
 
-        if !self.command.is_empty()
-            && !self.progress_filter.is_empty()
-            && self.output == AgentOutput::Text
+        if self.output == AgentOutput::Text
+            && (self.command_source == AgentSettingSource::BundledDefault
+                || (!self.command.is_empty() && !self.progress_filter.is_empty()))
         {
             self.output = AgentOutput::WrappedJson;
         }
@@ -148,9 +180,13 @@ fn parse_config(text: &str) -> Result<AppConfig, String> {
 
         match (section.as_str(), key) {
             ("agent", "label") => config.agent.label = parse_string(value)?,
-            ("agent", "command") => config.agent.command = parse_string_array(value)?,
+            ("agent", "command") => {
+                config.agent.command = parse_string_array(value)?;
+                config.agent.command_source = AgentSettingSource::Explicit;
+            }
             ("agent", "progress_filter") => {
-                config.agent.progress_filter = parse_string_array(value)?
+                config.agent.progress_filter = parse_string_array(value)?;
+                config.agent.progress_filter_source = AgentSettingSource::Explicit;
             }
             ("agent", "output") => {
                 config.agent.output = match parse_string(value)?.as_str() {
@@ -288,7 +324,7 @@ fn find_in_shim_dirs(filename: &str) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AgentOutput, AppConfig, bundled_agent_command, parse_config};
+    use super::{AgentOutput, AgentSettingSource, AppConfig, bundled_agent_command, parse_config};
     use std::{
         fs,
         time::{SystemTime, UNIX_EPOCH},
@@ -314,7 +350,12 @@ ignore_prefixes = ["vendor/", "dist/"]
 
         assert_eq!(config.agent.label, "codex");
         assert_eq!(config.agent.command, vec!["./agent.sh"]);
+        assert_eq!(config.agent.command_source, AgentSettingSource::Explicit);
         assert_eq!(config.agent.progress_filter, vec!["./filter.sh"]);
+        assert_eq!(
+            config.agent.progress_filter_source,
+            AgentSettingSource::Explicit
+        );
         assert_eq!(config.agent.output, AgentOutput::WrappedJson);
         assert_eq!(config.agent.workers, 4);
         assert_eq!(config.review.max_patch_bytes, 4096);
@@ -366,7 +407,15 @@ workers = 0
         assert_eq!(config.agent.output, AgentOutput::WrappedJson);
         assert_eq!(config.agent.workers, 4);
         assert_eq!(config.agent.command.len(), 1);
+        assert_eq!(
+            config.agent.command_source,
+            AgentSettingSource::BundledDefault
+        );
         assert_eq!(config.agent.progress_filter.len(), 1);
+        assert_eq!(
+            config.agent.progress_filter_source,
+            AgentSettingSource::BundledDefault
+        );
         assert_eq!(
             config.agent.command[0],
             bundled_agent_command("default")
@@ -374,6 +423,42 @@ workers = 0
                 .display()
                 .to_string()
         );
+
+        let _ = fs::remove_dir_all(repo_root);
+    }
+
+    #[test]
+    fn explicit_empty_progress_filter_suppresses_bundled_filter() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let repo_root = std::env::temp_dir().join(format!(
+            "anne-config-explicit-empty-filter-{}-{}",
+            std::process::id(),
+            unique
+        ));
+        fs::create_dir_all(repo_root.join(".anne")).unwrap();
+        fs::write(
+            repo_root.join(".anne/config.toml"),
+            "[agent]\nlabel = \"default\"\nprogress_filter = []\n",
+        )
+        .unwrap();
+
+        let config = AppConfig::load(&repo_root).unwrap();
+
+        assert_eq!(config.agent.label, "default");
+        assert_eq!(config.agent.command.len(), 1);
+        assert_eq!(
+            config.agent.command_source,
+            AgentSettingSource::BundledDefault
+        );
+        assert!(config.agent.progress_filter.is_empty());
+        assert_eq!(
+            config.agent.progress_filter_source,
+            AgentSettingSource::Explicit
+        );
+        assert_eq!(config.agent.output, AgentOutput::WrappedJson);
 
         let _ = fs::remove_dir_all(repo_root);
     }

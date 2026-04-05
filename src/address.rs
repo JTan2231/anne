@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     env, fs,
     path::{Path, PathBuf},
 };
@@ -149,6 +149,7 @@ pub fn run(comment_id: Option<String>) -> Result<RunResult, String> {
             run.status = result.status;
             run.spec_file = result.spec_file;
             run.agent_stderr = result.agent_stderr;
+            run.agent_runtime = result.agent_runtime;
             run.error = result.error.clone();
 
             if let Some(error) = result.error {
@@ -336,9 +337,10 @@ fn process_comment(
     match agent::run_captured(repo_root, agent_config, &prompt) {
         Ok(result) => {
             if let Err(error) = fs::write(bundle_root.join(&response_file), &result.raw_stdout) {
-                return CommentJobResult::failure(
+                return CommentJobResult::failure_with_runtime(
                     job.comment_index,
                     result.stderr_lines,
+                    result.runtime,
                     format!("failed writing {response_file}: {error}"),
                 );
             }
@@ -347,9 +349,10 @@ fn process_comment(
                 match finalize_spec(review_context, &job.comment, &result.assistant_text) {
                     Ok(spec_text) => spec_text,
                     Err(error) => {
-                        return CommentJobResult::failure(
+                        return CommentJobResult::failure_with_runtime(
                             job.comment_index,
                             result.stderr_lines,
+                            result.runtime,
                             error,
                         );
                     }
@@ -357,9 +360,10 @@ fn process_comment(
 
             let spec_file = build_spec_file(&job.comment);
             if let Err(error) = fs::write(bundle_root.join(&spec_file), spec_text) {
-                return CommentJobResult::failure(
+                return CommentJobResult::failure_with_runtime(
                     job.comment_index,
                     result.stderr_lines,
+                    result.runtime,
                     format!("failed writing {spec_file}: {error}"),
                 );
             }
@@ -369,6 +373,7 @@ fn process_comment(
                 status: CommentStatus::Generated,
                 spec_file: Some(spec_file),
                 agent_stderr: result.stderr_lines,
+                agent_runtime: Some(result.runtime),
                 error: None,
             }
         }
@@ -380,7 +385,12 @@ fn process_comment(
                     error.message
                 ),
             };
-            CommentJobResult::failure(job.comment_index, error.stderr_lines, message)
+            CommentJobResult::failure_with_runtime(
+                job.comment_index,
+                error.stderr_lines,
+                error.runtime,
+                message,
+            )
         }
     }
 }
@@ -622,6 +632,19 @@ fn render_summary(manifest: &Manifest) -> String {
         manifest.counts.specs_failed
     ));
 
+    let runtime_notes = manifest
+        .comments
+        .iter()
+        .filter_map(|comment| comment.agent_runtime.as_ref())
+        .filter_map(|runtime| runtime.runtime_note.as_deref())
+        .collect::<BTreeSet<_>>();
+    if !runtime_notes.is_empty() {
+        text.push_str("\n## Runtime Notes\n\n");
+        for note in runtime_notes {
+            text.push_str(&format!("- {note}\n"));
+        }
+    }
+
     if manifest.comments.is_empty() {
         text.push_str("\nNo comments selected from the source review.\n");
         return text;
@@ -703,16 +726,27 @@ struct CommentJobResult {
     status: CommentStatus,
     spec_file: Option<String>,
     agent_stderr: Vec<String>,
+    agent_runtime: Option<agent::AgentInvocation>,
     error: Option<String>,
 }
 
 impl CommentJobResult {
     fn failure(comment_index: usize, agent_stderr: Vec<String>, error: String) -> Self {
+        Self::failure_with_runtime(comment_index, agent_stderr, None, error)
+    }
+
+    fn failure_with_runtime(
+        comment_index: usize,
+        agent_stderr: Vec<String>,
+        agent_runtime: impl Into<Option<agent::AgentInvocation>>,
+        error: String,
+    ) -> Self {
         Self {
             comment_index,
             status: CommentStatus::Failed,
             spec_file: None,
             agent_stderr,
+            agent_runtime: agent_runtime.into(),
             error: Some(error),
         }
     }
@@ -1080,6 +1114,10 @@ impl RuntimeManifest {
         let mut agent = BTreeMap::new();
         agent.insert("command".to_string(), string_array(&self.agent.command));
         agent.insert(
+            "command_source".to_string(),
+            JsonValue::string(self.agent.command_source.as_str()),
+        );
+        agent.insert(
             "enable_script_wrapper".to_string(),
             JsonValue::Bool(self.agent.enable_script_wrapper),
         );
@@ -1094,6 +1132,10 @@ impl RuntimeManifest {
         agent.insert(
             "progress_filter".to_string(),
             string_array(&self.agent.progress_filter),
+        );
+        agent.insert(
+            "progress_filter_source".to_string(),
+            JsonValue::string(self.agent.progress_filter_source.as_str()),
         );
         agent.insert("workers".to_string(), JsonValue::number(self.agent.workers));
 
@@ -1156,6 +1198,7 @@ struct CommentRun {
     agent_prompt_file: Option<String>,
     agent_response_file: Option<String>,
     agent_stderr: Vec<String>,
+    agent_runtime: Option<agent::AgentInvocation>,
     error: Option<String>,
 }
 
@@ -1173,6 +1216,7 @@ impl CommentRun {
             agent_prompt_file: None,
             agent_response_file: None,
             agent_stderr: Vec::new(),
+            agent_runtime: None,
             error: None,
         }
     }
@@ -1201,6 +1245,11 @@ impl CommentRun {
                     .collect(),
             ),
         );
+        if let Some(runtime) = &self.agent_runtime {
+            object.insert("agent_runtime".to_string(), runtime.to_json());
+        } else {
+            object.insert("agent_runtime".to_string(), JsonValue::Null);
+        }
         object.insert(
             "comment_id".to_string(),
             JsonValue::string(self.comment_id.clone()),

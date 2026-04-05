@@ -420,6 +420,62 @@ EOF
 }
 
 #[test]
+fn address_recovers_wrapped_json_output_without_progress_filter() {
+    let repo = TestRepo::new("wrapped-json-no-filter");
+    init_repo(repo.path());
+    write_init_template(repo.path());
+
+    let agent = agent_script(
+        repo.path(),
+        r##"cat >/dev/null
+printf '%s\n' '{"type":"item.completed","item":{"type":"reasoning","text":"thinking"}}'
+cat <<'EOF'
+{"type":"item.completed","item":{"type":"agent_message","text":"# Anne\n\n## Feature: Wrapped-json fallback\n\n### Problem\n\nAnne should recover the final spec without a shell filter.\n\n### Goals\n\n- Decode the final assistant message directly.\n\n### Non-Goals\n\n- Requiring jq for address generation.\n\n## Proposed Approach\n\nUse Anne's wrapped-json decoder.\n"}}
+EOF
+"##,
+    );
+    write_agent_config(repo.path(), "wrapped-json", &agent, None);
+
+    write_review_bundle(
+        repo.path(),
+        "2026-04-04T12-40-00Z-wrapped-json-no-filter",
+        Some("2026-04-04T12:40:00Z"),
+        &[ReviewCommentSpec {
+            id: "R001",
+            path: "src/lib.rs",
+            side: "new",
+            line: 2,
+            severity: "warning",
+            title: "Wrapped title",
+            body: "Wrapped body.",
+            hunk_header: Some("@@ -1,1 +1,2 @@"),
+            patch_file: Some("files/0001-src-lib.rs.patch"),
+        }],
+    );
+
+    let output = anne(repo.path(), &["address"]);
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let bundle = address_bundle_path(repo.path(), &output.stdout);
+    let manifest = fs::read_to_string(bundle.join("manifest.json")).unwrap();
+    assert!(manifest.contains("\"status\": \"succeeded\""));
+    assert!(manifest.contains("\"assistant_text_source\": \"wrapped-json-decoder\""));
+    assert!(manifest.contains("\"progress_filter_ran\": false"));
+
+    let response = fs::read_to_string(bundle.join("agent/R001.response.txt")).unwrap();
+    assert!(response.contains("\"agent_message\""));
+
+    let spec = fs::read_to_string(bundle.join("specs/R001-Wrapped-title.md")).unwrap();
+    assert!(spec.contains("## Source Comment"));
+    assert!(spec.contains("## Feature: Wrapped-json fallback"));
+}
+
+#[test]
 fn address_rejects_headingless_response_but_continues_later_comments() {
     let repo = TestRepo::new("headingless-response");
     init_repo(repo.path());

@@ -7,7 +7,7 @@
   "target_branch": null,
   "work_ref": "workflow-job:wf-run_18eb990701ec4d15bde91dfe03a0c13b-develop_draft__persist_plan",
   "status": "proposed",
-  "summary": "# Anne",
+  "summary": "Support mutate-style command substitution in the draft workflow’s persisted plan-state handling.",
   "created_at": "2026-04-05T04:23:18.965238162+00:00",
   "updated_at": "2026-04-05T04:23:18.965238162+00:00",
   "job_ids": {

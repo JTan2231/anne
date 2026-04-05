@@ -278,11 +278,71 @@ fn review_uses_bundled_default_agent_shim_when_config_is_missing() {
 
     let manifest = fs::read_to_string(bundle.join("manifest.json")).unwrap();
     assert!(manifest.contains("\"label\": \"default\""));
+    assert!(manifest.contains("\"command_source\": \"bundled-default\""));
     assert!(manifest.contains("default/agent.sh"));
     assert!(manifest.contains("default/filter.sh"));
+    assert!(manifest.contains("\"progress_filter_source\": \"bundled-default\""));
+    assert!(manifest.contains("\"bundled_filter_requested\": true"));
+    assert!(manifest.contains("\"progress_filter_ran\": true"));
+    assert!(manifest.contains("\"assistant_text_source\": \"progress-filter\""));
 
-    let response = fs::read_to_string(bundle.join("agent/0001-src-lib.rs.response.txt")).unwrap();
-    assert!(response.contains("\"agent_message\""));
+    assert!(bundle.join("agent/0001-src-lib.rs.response.txt").exists());
+}
+
+#[test]
+fn review_skips_bundled_default_filter_when_jq_is_missing() {
+    let repo = TestRepo::new("bundled-default-no-jq");
+    init_repo(repo.path());
+
+    write_file(
+        &repo.path().join("src/lib.rs"),
+        "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n",
+    );
+    commit_all(repo.path(), "initial");
+
+    create_and_checkout_branch(repo.path(), "feature");
+    write_file(
+        &repo.path().join("src/lib.rs"),
+        "pub fn add(a: i32, b: i32) -> i32 {\n    a + b + 1\n}\n",
+    );
+    commit_all(repo.path(), "feature changes");
+
+    checkout_branch(repo.path(), "main");
+
+    let bin_dir = repo.path().join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    bundled_default_runtime_tools(&bin_dir);
+    codex_script(&bin_dir);
+
+    let path_env = bin_dir.display().to_string();
+    let output = anne_with_path(repo.path(), &["review", "main...feature"], Some(&path_env));
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Bundled default progress filter skipped"));
+
+    let bundle = bundle_path(repo.path(), &output.stdout);
+    let comments_json = fs::read_to_string(bundle.join("comments.json")).unwrap();
+    assert_eq!(comments_json.trim(), "[]");
+
+    let comments_md = fs::read_to_string(bundle.join("comments.md")).unwrap();
+    assert!(comments_md.contains("Runtime Notes"));
+    assert!(comments_md.contains("Bundled default progress filter skipped"));
+
+    let manifest = fs::read_to_string(bundle.join("manifest.json")).unwrap();
+    assert!(manifest.contains("\"status\": \"succeeded\""));
+    assert!(manifest.contains("\"errors\": []"));
+    assert!(manifest.contains("\"bundled_filter_requested\": true"));
+    assert!(manifest.contains("\"progress_filter_ran\": false"));
+    assert!(manifest.contains("\"progress_filter_skip_reason\": \"jq was not found on PATH\""));
+    assert!(manifest.contains("\"assistant_text_source\": \"wrapped-json-decoder\""));
+
+    assert!(bundle.join("agent/0001-src-lib.rs.response.txt").exists());
 }
 
 #[test]
@@ -387,6 +447,95 @@ fn review_uses_progress_filter_and_fails_on_invalid_anchor() {
 
     let response = fs::read_to_string(bundle.join("agent/0001-src-lib.rs.response.txt")).unwrap();
     assert!(response.contains("FINAL:[{"));
+}
+
+#[test]
+fn review_explicit_progress_filter_dependency_failure_is_still_fatal() {
+    let repo = TestRepo::new("explicit-filter-missing-dependency");
+    init_repo(repo.path());
+
+    write_file(
+        &repo.path().join("src/lib.rs"),
+        "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n",
+    );
+    commit_all(repo.path(), "initial");
+
+    create_and_checkout_branch(repo.path(), "feature");
+    write_file(
+        &repo.path().join("src/lib.rs"),
+        "pub fn add(a: i32, b: i32) -> i32 {\n    a + b + 1\n}\n",
+    );
+    commit_all(repo.path(), "feature changes");
+
+    checkout_branch(repo.path(), "main");
+
+    let agent = agent_script(
+        repo.path(),
+        "while IFS= read -r _line; do :; done\nprintf '%s\\n' '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"[]\"}}'\n",
+    );
+    let filter = filter_requires_jq_script(repo.path());
+    write_agent_config(repo.path(), "wrapped-json", &agent, Some(&filter));
+
+    let output = anne_with_path(repo.path(), &["review", "main...feature"], Some(""));
+    assert!(
+        !output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let bundle = bundle_path(repo.path(), &output.stdout);
+    let manifest = fs::read_to_string(bundle.join("manifest.json")).unwrap();
+    assert!(manifest.contains("\"status\": \"failed\""));
+    assert!(manifest.contains("\"progress_filter_ran\": true"));
+
+    assert!(bundle.join("agent/0001-src-lib.rs.response.txt").exists());
+}
+
+#[test]
+fn review_wrapped_json_protocol_failure_preserves_raw_response() {
+    let repo = TestRepo::new("wrapped-json-protocol-failure");
+    init_repo(repo.path());
+
+    write_file(
+        &repo.path().join("src/lib.rs"),
+        "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n",
+    );
+    commit_all(repo.path(), "initial");
+
+    create_and_checkout_branch(repo.path(), "feature");
+    write_file(
+        &repo.path().join("src/lib.rs"),
+        "pub fn add(a: i32, b: i32) -> i32 {\n    a + b + 1\n}\n",
+    );
+    commit_all(repo.path(), "feature changes");
+
+    checkout_branch(repo.path(), "main");
+
+    let agent = agent_script(
+        repo.path(),
+        "while IFS= read -r _line; do :; done\nprintf '%s\\n' '{\"type\":\"item.completed\",\"item\":{\"type\":\"reasoning\",\"text\":\"thinking\"}}'\n",
+    );
+    write_agent_config(repo.path(), "wrapped-json", &agent, None);
+
+    let output = anne(repo.path(), &["review", "main...feature"]);
+    assert!(
+        !output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let bundle = bundle_path(repo.path(), &output.stdout);
+    let manifest = fs::read_to_string(bundle.join("manifest.json")).unwrap();
+    assert!(manifest.contains("\"status\": \"failed\""));
+    assert!(
+        manifest.contains("failed recovering final assistant message from wrapped-json stdout")
+    );
+    assert!(manifest.contains("\"assistant_text_source\": \"wrapped-json-decoder\""));
+
+    let response = fs::read_to_string(bundle.join("agent/0001-src-lib.rs.response.txt")).unwrap();
+    assert!(response.contains("\"reasoning\""));
 }
 
 #[test]
@@ -884,11 +1033,42 @@ fn filter_script(path: &Path) -> PathBuf {
     script
 }
 
+fn filter_requires_jq_script(path: &Path) -> PathBuf {
+    let script = path.join("filter-requires-jq.sh");
+    write_executable(
+        &script,
+        "#!/bin/sh\nset -eu\nif ! command -v jq >/dev/null 2>&1; then\n  printf 'custom filter requires jq\\n' >&2\n  exit 7\nfi\ncat >/dev/null\n",
+    );
+    script
+}
+
 fn codex_script(path: &Path) -> PathBuf {
     let script = path.join("codex");
     write_executable(
         &script,
         "#!/usr/bin/env bash\nset -euo pipefail\n[ \"$1\" = \"exec\" ]\n[ \"$2\" = \"--json\" ]\n[ \"$3\" = \"-\" ]\nmkdir -p .anne-test\ncat >.anne-test/codex-stdin.bin\nprintf '%s\\n' '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"[]\"}}'\n",
+    );
+    script
+}
+
+fn bundled_default_runtime_tools(path: &Path) {
+    for name in ["bash", "cat", "mkdir", "mktemp", "rm"] {
+        passthrough_script(path, name);
+    }
+}
+
+fn passthrough_script(path: &Path, name: &str) -> PathBuf {
+    let script = path.join(name);
+    let target = [
+        Path::new("/bin").join(name),
+        Path::new("/usr/bin").join(name),
+    ]
+    .into_iter()
+    .find(|candidate| candidate.is_file())
+    .unwrap_or_else(|| panic!("missing passthrough target for {name}"));
+    write_executable(
+        &script,
+        &format!("#!/bin/sh\nexec {} \"$@\"\n", target.display()),
     );
     script
 }

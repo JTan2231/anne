@@ -275,6 +275,7 @@ fn run_materialized(request: ReviewRequest, prepared: PreparedRun) -> RunResult 
             let mut findings = findings.borrow_mut();
             let file = &mut files[result.file_index];
             file.agent_stderr = result.agent_stderr;
+            file.agent_runtime = result.agent_runtime;
             file.findings = result.findings.len();
             file.error = result.error.clone();
 
@@ -452,9 +453,10 @@ fn review_file(
     match agent::run_captured(repo_root, agent_config, &prompt) {
         Ok(result) => {
             if let Err(error) = fs::write(bundle_root.join(&response_file), &result.raw_stdout) {
-                return ReviewJobResult::failure(
+                return ReviewJobResult::failure_with_runtime(
                     job.file_index,
                     result.stderr_lines,
+                    result.runtime,
                     format!("failed writing {response_file}: {error}"),
                 );
             }
@@ -465,10 +467,16 @@ fn review_file(
                 Ok(findings) => ReviewJobResult {
                     file_index: job.file_index,
                     agent_stderr: result.stderr_lines,
+                    agent_runtime: Some(result.runtime),
                     findings,
                     error: None,
                 },
-                Err(error) => ReviewJobResult::failure(job.file_index, result.stderr_lines, error),
+                Err(error) => ReviewJobResult::failure_with_runtime(
+                    job.file_index,
+                    result.stderr_lines,
+                    result.runtime,
+                    error,
+                ),
             }
         }
         Err(error) => {
@@ -480,7 +488,12 @@ fn review_file(
                 ),
             };
 
-            ReviewJobResult::failure(job.file_index, error.stderr_lines, message)
+            ReviewJobResult::failure_with_runtime(
+                job.file_index,
+                error.stderr_lines,
+                error.runtime,
+                message,
+            )
         }
     }
 }
@@ -680,6 +693,7 @@ fn build_file(
         findings: 0,
         error: None,
         agent_stderr: Vec::new(),
+        agent_runtime: None,
     })
 }
 
@@ -977,6 +991,20 @@ fn render_file_review_markdown(manifest: &Manifest, findings: &[Finding]) -> Str
         manifest.diff_patch.as_deref().unwrap_or("unavailable")
     ));
 
+    let runtime_notes = manifest
+        .files
+        .iter()
+        .filter_map(|file| file.agent_runtime.as_ref())
+        .filter_map(|runtime| runtime.runtime_note.as_deref())
+        .collect::<BTreeSet<_>>();
+    if !runtime_notes.is_empty() {
+        text.push_str("## Runtime Notes\n\n");
+        for note in runtime_notes {
+            text.push_str(&format!("- {note}\n"));
+        }
+        text.push('\n');
+    }
+
     let mut findings_by_path: BTreeMap<&str, Vec<&Finding>> = BTreeMap::new();
     for finding in findings {
         findings_by_path
@@ -1110,15 +1138,26 @@ struct ReviewJob {
 struct ReviewJobResult {
     file_index: usize,
     agent_stderr: Vec<String>,
+    agent_runtime: Option<agent::AgentInvocation>,
     findings: Vec<Finding>,
     error: Option<String>,
 }
 
 impl ReviewJobResult {
     fn failure(file_index: usize, agent_stderr: Vec<String>, error: String) -> Self {
+        Self::failure_with_runtime(file_index, agent_stderr, None, error)
+    }
+
+    fn failure_with_runtime(
+        file_index: usize,
+        agent_stderr: Vec<String>,
+        agent_runtime: impl Into<Option<agent::AgentInvocation>>,
+        error: String,
+    ) -> Self {
         Self {
             file_index,
             agent_stderr,
+            agent_runtime: agent_runtime.into(),
             findings: Vec::new(),
             error: Some(error),
         }
@@ -1140,6 +1179,7 @@ struct ReviewFile {
     findings: usize,
     error: Option<String>,
     agent_stderr: Vec<String>,
+    agent_runtime: Option<agent::AgentInvocation>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1440,6 +1480,10 @@ impl RuntimeManifest {
         let mut agent = BTreeMap::new();
         agent.insert("command".to_string(), string_array(&self.agent.command));
         agent.insert(
+            "command_source".to_string(),
+            JsonValue::string(self.agent.command_source.as_str()),
+        );
+        agent.insert(
             "enable_script_wrapper".to_string(),
             JsonValue::Bool(self.agent.enable_script_wrapper),
         );
@@ -1454,6 +1498,10 @@ impl RuntimeManifest {
         agent.insert(
             "progress_filter".to_string(),
             string_array(&self.agent.progress_filter),
+        );
+        agent.insert(
+            "progress_filter_source".to_string(),
+            JsonValue::string(self.agent.progress_filter_source.as_str()),
         );
         agent.insert("workers".to_string(), JsonValue::number(self.agent.workers));
 
@@ -1519,6 +1567,7 @@ struct FileRecord {
     findings: usize,
     error: Option<String>,
     agent_stderr: Vec<String>,
+    agent_runtime: Option<agent::AgentInvocation>,
 }
 
 impl FileRecord {
@@ -1535,6 +1584,7 @@ impl FileRecord {
             findings: file.findings,
             error: file.error.clone(),
             agent_stderr: file.agent_stderr.clone(),
+            agent_runtime: file.agent_runtime.clone(),
         }
     }
 
@@ -1566,6 +1616,11 @@ impl FileRecord {
                     .collect(),
             ),
         );
+        if let Some(runtime) = &self.agent_runtime {
+            object.insert("agent_runtime".to_string(), runtime.to_json());
+        } else {
+            object.insert("agent_runtime".to_string(), JsonValue::Null);
+        }
         if let Some(error) = &self.error {
             object.insert("error".to_string(), JsonValue::string(error.clone()));
         } else {
