@@ -33,7 +33,7 @@ struct PreparedRun {
     config: AppConfig,
     review_context: ReviewContext,
     selected_comments: Vec<SourceComment>,
-    init_structure: InitStructure,
+    spec_structure: SpecStructure,
     generated_at: String,
     selection_filter: String,
     bundle: ReservedAddressBundle,
@@ -68,13 +68,7 @@ fn prepare_run(comment_id: Option<String>) -> Result<PreparedRun, String> {
         selected_comments = vec![selected];
     }
 
-    let init_path = repo_root.join("INIT.md");
-    let init_text = fs::read_to_string(&init_path).map_err(|error| {
-        format!(
-            "address requires a readable INIT.md as the current feature-spec structure reference: {error}"
-        )
-    })?;
-    let init_structure = InitStructure::derive(&init_text)?;
+    let spec_structure = SpecStructure::default();
 
     if !selected_comments.is_empty() && config.agent.command.is_empty() {
         return Err(
@@ -91,7 +85,7 @@ fn prepare_run(comment_id: Option<String>) -> Result<PreparedRun, String> {
         config,
         review_context,
         selected_comments,
-        init_structure,
+        spec_structure,
         generated_at,
         selection_filter,
         bundle,
@@ -104,7 +98,7 @@ fn run_reserved(prepared: PreparedRun) -> RunResult {
         config,
         review_context,
         selected_comments,
-        init_structure,
+        spec_structure,
         generated_at,
         selection_filter,
         bundle,
@@ -130,8 +124,7 @@ fn run_reserved(prepared: PreparedRun) -> RunResult {
         source_review: SourceReviewManifest::from_context(&review_context),
         runtime: RuntimeManifest {
             agent: config.agent.clone(),
-            init_path: "INIT.md".to_string(),
-            init_headings: init_structure.headings.clone(),
+            spec_headings: spec_structure.headings.clone(),
         },
         comments: selected_comments
             .iter()
@@ -205,7 +198,7 @@ fn run_reserved(prepared: PreparedRun) -> RunResult {
                 &repo_root,
                 &bundle_root,
                 &review_context,
-                &init_structure,
+                &spec_structure,
                 &config.agent,
                 job,
             )
@@ -456,13 +449,13 @@ fn process_comment(
     repo_root: &Path,
     bundle_root: &Path,
     review_context: &ReviewContext,
-    init_structure: &InitStructure,
+    spec_structure: &SpecStructure,
     agent_config: &AgentConfig,
     job: CommentJob,
 ) -> CommentJobResult {
     let prompt_file = format!("agent/{}.prompt.md", job.comment.id);
     let response_file = format!("agent/{}.response.txt", job.comment.id);
-    let prompt = build_prompt(review_context, init_structure, &job.comment);
+    let prompt = build_prompt(review_context, spec_structure, &job.comment);
 
     if let Err(error) = fs::write(bundle_root.join(&prompt_file), &prompt) {
         return CommentJobResult::failure(
@@ -535,7 +528,7 @@ fn process_comment(
 
 fn build_prompt(
     review_context: &ReviewContext,
-    init_structure: &InitStructure,
+    spec_structure: &SpecStructure,
     comment: &SourceComment,
 ) -> String {
     let mut prompt = String::new();
@@ -604,12 +597,12 @@ fn build_prompt(
         }
     }
 
-    prompt.push_str("\nAnne feature-spec structure guidance derived from INIT.md:\n");
-    prompt.push_str(&init_structure.render_guidance());
+    prompt.push_str("\nAnne feature-spec structure guidance:\n");
+    prompt.push_str(&spec_structure.render_guidance());
 
     prompt.push_str(
         "\nRequirements for the generated spec:\n\
-- Follow Anne's current feature-spec structure and level of detail without copying INIT.md's review-specific subject matter.\n\
+- Follow Anne's current feature-spec structure and level of detail, adapting it to this comment-specific spec instead of copying any template text literally.\n\
 - Include a `## Source Comment` section near the top for traceability.\n\
 - Stay focused on addressing comment ",
     );
@@ -1125,7 +1118,7 @@ impl SourceComment {
 }
 
 #[derive(Debug, Clone)]
-struct InitStructure {
+struct SpecStructure {
     title: String,
     feature_heading: Option<String>,
     feature_subsections: Vec<String>,
@@ -1133,54 +1126,36 @@ struct InitStructure {
     headings: Vec<String>,
 }
 
-impl InitStructure {
-    fn derive(init_text: &str) -> Result<Self, String> {
-        let headings = init_text
-            .lines()
-            .filter_map(|line| {
-                let trimmed = line.trim();
-                (trimmed.starts_with("# ")
-                    || trimmed.starts_with("## ")
-                    || trimmed.starts_with("### "))
-                .then_some(trimmed.to_string())
-            })
-            .collect::<Vec<_>>();
+impl Default for SpecStructure {
+    fn default() -> Self {
+        let headings = vec![
+            "# Anne".to_string(),
+            "## Feature: <short feature name>".to_string(),
+            "### Problem".to_string(),
+            "### Goals".to_string(),
+            "### Non-Goals".to_string(),
+            "## Proposed Approach".to_string(),
+            "## Execution Flow".to_string(),
+        ];
 
-        let title = headings
-            .iter()
-            .find_map(|heading| heading.strip_prefix("# ").map(ToString::to_string))
-            .ok_or_else(|| "INIT.md must contain a `# ...` title heading".to_string())?;
-
-        let mut feature_heading = None;
-        let mut feature_subsections = Vec::new();
-        let mut other_sections = Vec::new();
-        let mut in_feature = false;
-
-        for heading in &headings {
-            if let Some(section) = heading.strip_prefix("## ") {
-                if section.starts_with("Feature:") {
-                    feature_heading = Some(section.to_string());
-                    in_feature = true;
-                } else {
-                    other_sections.push(section.to_string());
-                    in_feature = false;
-                }
-            } else if let Some(subsection) = heading.strip_prefix("### ")
-                && in_feature
-            {
-                feature_subsections.push(subsection.to_string());
-            }
-        }
-
-        Ok(Self {
-            title,
-            feature_heading,
-            feature_subsections,
-            other_sections,
+        Self {
+            title: "Anne".to_string(),
+            feature_heading: Some("Feature: <short feature name>".to_string()),
+            feature_subsections: vec![
+                "Problem".to_string(),
+                "Goals".to_string(),
+                "Non-Goals".to_string(),
+            ],
+            other_sections: vec![
+                "Proposed Approach".to_string(),
+                "Execution Flow".to_string(),
+            ],
             headings,
-        })
+        }
     }
+}
 
+impl SpecStructure {
     fn render_guidance(&self) -> String {
         let mut text = String::new();
         text.push_str(&format!("- Root title: # {}\n", self.title));
@@ -1188,17 +1163,17 @@ impl InitStructure {
             text.push_str("- Core feature heading pattern: ## Feature: <short feature name>\n");
         }
         if self.feature_subsections.is_empty() {
-            text.push_str("- INIT.md does not define feature subsections explicitly.\n");
+            text.push_str("- The standard Anne spec shape does not define feature subsections explicitly.\n");
         } else {
-            text.push_str("- Feature subsections in INIT.md order:\n");
+            text.push_str("- Feature subsections in Anne spec order:\n");
             for subsection in &self.feature_subsections {
                 text.push_str(&format!("  - ### {subsection}\n"));
             }
         }
         if self.other_sections.is_empty() {
-            text.push_str("- No additional top-level sections were detected in INIT.md.\n");
+            text.push_str("- No additional top-level sections are part of the standard Anne spec shape.\n");
         } else {
-            text.push_str("- Additional top-level sections currently present in INIT.md:\n");
+            text.push_str("- Additional top-level sections in Anne spec order:\n");
             for section in &self.other_sections {
                 text.push_str(&format!("  - ## {section}\n"));
             }
@@ -1361,8 +1336,7 @@ impl SourceReviewManifest {
 #[derive(Debug, Clone)]
 struct RuntimeManifest {
     agent: AgentConfig,
-    init_path: String,
-    init_headings: Vec<String>,
+    spec_headings: Vec<String>,
 }
 
 impl RuntimeManifest {
@@ -1398,18 +1372,14 @@ impl RuntimeManifest {
         let mut object = BTreeMap::new();
         object.insert("agent".to_string(), JsonValue::Object(agent));
         object.insert(
-            "init_headings".to_string(),
+            "spec_headings".to_string(),
             JsonValue::Array(
-                self.init_headings
+                self.spec_headings
                     .iter()
                     .cloned()
                     .map(JsonValue::string)
                     .collect(),
             ),
-        );
-        object.insert(
-            "init_path".to_string(),
-            JsonValue::string(self.init_path.clone()),
         );
         JsonValue::Object(object)
     }
@@ -1534,7 +1504,7 @@ impl CommentRun {
 #[cfg(test)]
 mod tests {
     use super::{
-        InitStructure, ReviewCandidate, ReviewManifest, build_address_id, reserve_address_bundle,
+        ReviewCandidate, ReviewManifest, SpecStructure, build_address_id, reserve_address_bundle,
         sort_review_candidates,
     };
     use std::{
@@ -1544,30 +1514,18 @@ mod tests {
     };
 
     #[test]
-    fn derives_feature_shape_from_init() {
-        let structure = InitStructure::derive(
-            "\
-# Anne
-
-## Feature: Example
-
-### Problem
-
-### Goals
-
-### Non-Goals
-
-## Proposed Approach
-",
-        )
-        .unwrap();
+    fn default_spec_structure_matches_anne_shape() {
+        let structure = SpecStructure::default();
 
         assert_eq!(structure.title, "Anne");
         assert_eq!(
             structure.feature_subsections,
             ["Problem", "Goals", "Non-Goals"]
         );
-        assert_eq!(structure.other_sections, ["Proposed Approach"]);
+        assert_eq!(
+            structure.other_sections,
+            ["Proposed Approach", "Execution Flow"]
+        );
     }
 
     #[test]

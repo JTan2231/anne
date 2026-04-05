@@ -172,7 +172,7 @@ esac
 
     let prompt = fs::read_to_string(bundle.join("agent/R001.prompt.md")).unwrap();
     assert!(prompt.contains("- Core feature heading pattern: ## Feature: <short feature name>"));
-    assert!(prompt.contains("- Feature subsections in INIT.md order:"));
+    assert!(prompt.contains("- Feature subsections in Anne spec order:"));
     assert!(prompt.contains("  - ### Problem"));
     assert!(
         prompt.contains("Include a `## Source Comment` section near the top for traceability.")
@@ -1543,9 +1543,37 @@ fn address_rejects_unknown_comment_before_bundle_creation() {
 }
 
 #[test]
-fn address_requires_readable_init_before_bundle_creation() {
+fn address_generates_specs_without_referring_to_init() {
     let repo = TestRepo::new("missing-init");
     init_repo(repo.path());
+
+    let agent = agent_script(
+        repo.path(),
+        r#"cat >/dev/null
+cat <<'EOF'
+# Anne
+
+## Feature: No init dependency
+
+### Problem
+
+Address should not depend on INIT.md being present.
+
+### Goals
+
+- Generate a focused spec from the review comment alone.
+
+### Non-Goals
+
+- Threading INIT.md through the address workflow.
+
+## Proposed Approach
+
+Use the built-in Anne spec shape.
+EOF
+"#,
+    );
+    write_agent_config(repo.path(), "text", &agent, None);
 
     write_review_bundle(
         repo.path(),
@@ -1566,15 +1594,21 @@ fn address_requires_readable_init_before_bundle_creation() {
 
     let output = anne(repo.path(), &["address"]);
     assert!(
-        !output.status.success(),
+        output.status.success(),
         "stdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("INIT.md"));
-    assert!(!repo.path().join(".anne/address").exists());
+    let bundle = address_bundle_path(repo.path(), &output.stdout);
+    let prompt = fs::read_to_string(bundle.join("agent/R001.prompt.md")).unwrap();
+    assert!(!prompt.contains("INIT.md"));
+    assert!(prompt.contains("- Feature subsections in Anne spec order:"));
+
+    let manifest = fs::read_to_string(bundle.join("manifest.json")).unwrap();
+    assert!(!manifest.contains("\"init_path\""));
+    assert!(!manifest.contains("\"init_headings\""));
+    assert!(manifest.contains("\"spec_headings\""));
 }
 
 #[test]
