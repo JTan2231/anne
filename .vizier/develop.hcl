@@ -1,6 +1,10 @@
 id = "template.develop"
 version = "v1"
 
+params = {
+  spec_source = "file"
+}
+
 cli = {
   positional = ["spec_file", "slug", "branch", "target_branch"]
   named = {
