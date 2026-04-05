@@ -7,7 +7,7 @@
   "target_branch": null,
   "work_ref": "workflow-job:wf-run_1f44ef0979e44cba8a75cfd5d84aadd1-develop_draft__persist_plan",
   "status": "proposed",
-  "summary": "# Anne",
+  "summary": "Plan address",
   "created_at": "2026-04-04T15:59:48.486451397+00:00",
   "updated_at": "2026-04-04T15:59:48.486451397+00:00",
   "job_ids": {

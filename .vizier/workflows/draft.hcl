@@ -184,7 +184,7 @@ SCRIPT
   },
   {
     id = "rewrite_plan_state_provenance"
-    name = "Draft / Rewrite Plan State Provenance"
+    name = "Draft / Rewrite Plan State"
     kind = "shell"
     uses = "cap.env.shell.command.run"
     args = {
@@ -195,78 +195,10 @@ slug="$${slug}"
 spec_file="$${spec_file}"
 spec_source="$${spec_source}"
 
-SLUG="$slug" SPEC_FILE="$spec_file" SPEC_SOURCE="$spec_source" python3 - <<'PY'
-from pathlib import Path
-import json
-import os
-import sys
-
-root = Path.cwd().resolve()
-slug = os.environ["SLUG"].strip()
-spec_file = os.environ.get("SPEC_FILE", "").strip()
-spec_source = os.environ["SPEC_SOURCE"].strip().lower()
-
-plan_doc = root / ".vizier" / "implementation-plans" / f"{slug}.md"
-if not plan_doc.exists():
-    sys.stderr.write(
-        f"draft provenance rewrite failed: missing plan doc `{plan_doc.relative_to(root)}`\\n"
-    )
-    raise SystemExit(1)
-
-plan_id = None
-frontmatter_open = False
-for line in plan_doc.read_text().splitlines():
-    if line.strip() == "---":
-        if frontmatter_open:
-            break
-        frontmatter_open = True
-        continue
-    if frontmatter_open and line.startswith("plan_id:"):
-        plan_id = line.split(":", 1)[1].strip()
-        break
-
-if not plan_id:
-    sys.stderr.write(
-        f"draft provenance rewrite failed: missing plan_id front matter in `{plan_doc.relative_to(root)}`\\n"
-    )
-    raise SystemExit(1)
-
-state_path = root / ".vizier" / "state" / "plans" / f"{plan_id}.json"
-if not state_path.exists():
-    sys.stderr.write(
-        f"draft provenance rewrite failed: missing plan state `{state_path.relative_to(root)}`\\n"
-    )
-    raise SystemExit(1)
-
-record = json.loads(state_path.read_text())
-
-if spec_file:
-    if spec_source != "file":
-        sys.stderr.write(
-            f"draft provenance rewrite failed: spec_file `{spec_file}` requires spec_source=file, got `{spec_source}`\\n"
-        )
-        raise SystemExit(1)
-    spec_path = (root / spec_file).resolve()
-    try:
-        source_path = spec_path.relative_to(root).as_posix()
-    except ValueError:
-        sys.stderr.write(
-            f"draft provenance rewrite failed: spec_file `{spec_file}` is outside the repository root\\n"
-        )
-        raise SystemExit(1)
-    record["source"] = "file"
-    record["source_path"] = source_path
-else:
-    if spec_source not in {"inline", "stdin"}:
-        sys.stderr.write(
-            f"draft provenance rewrite failed: inline plan state requires spec_source=inline|stdin, got `{spec_source}`\\n"
-        )
-        raise SystemExit(1)
-    record["source"] = "inline"
-    record.pop("source_path", None)
-
-state_path.write_text(json.dumps(record, indent=2) + "\\n")
-PY
+python3 .vizier/scripts/rewrite_plan_state.py \
+  --slug "$slug" \
+  --spec-file "$spec_file" \
+  --spec-source "$spec_source"
 SCRIPT
     }
     on = {

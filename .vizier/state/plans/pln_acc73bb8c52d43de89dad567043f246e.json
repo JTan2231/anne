@@ -7,7 +7,7 @@
   "target_branch": null,
   "work_ref": "workflow-job:wf-run_c5534c237e8d436990774a486291b0e4-develop_draft__persist_plan",
   "status": "proposed",
-  "summary": "# Anne",
+  "summary": "Plan lib",
   "created_at": "2026-04-04T03:33:03.724650753+00:00",
   "updated_at": "2026-04-04T03:33:03.724650753+00:00",
   "job_ids": {

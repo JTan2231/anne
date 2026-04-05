@@ -7,7 +7,7 @@
   "target_branch": null,
   "work_ref": "workflow-job:wf-run_e608f288e3934c07bb87f4a4f12cddb0-develop_draft__persist_plan",
   "status": "proposed",
-  "summary": "# Anne",
+  "summary": "Plan r004-git-cli-guard-coverage-is-o",
   "created_at": "2026-04-05T03:15:53.187257643+00:00",
   "updated_at": "2026-04-05T03:15:53.187257643+00:00",
   "job_ids": {
