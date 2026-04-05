@@ -71,20 +71,18 @@ progress() {
   [ -n "$msg" ] && printf '%s\n' "$msg" >&2
 }
 
+first_collapsed_summary() {
+  for value in "$@"; do
+    summary=$(collapse "$value")
+    if [ -n "$summary" ]; then
+      printf '%s' "$summary"
+      return
+    fi
+  done
+}
+
 fallback_item_summary() {
-  summary=$(collapse "$1")
-  if [ -n "$summary" ]; then
-    printf '%s' "$summary"
-    return
-  fi
-
-  summary=$(collapse "$2")
-  if [ -n "$summary" ]; then
-    printf '%s' "$summary"
-    return
-  fi
-
-  printf '%s' "$(collapse "$3")"
+  first_collapsed_summary "$1" "$2" "$3"
 }
 
 final_text=""
@@ -111,6 +109,19 @@ while IFS= read -r line; do
 
     turn.started)
       progress "$(paint 35 "turn started")"
+      ;;
+
+    turn.failed)
+      error_message=$(printf '%s' "$line" | jq -r 'try .error.message // ""' 2>/dev/null)
+      message=$(printf '%s' "$line" | jq -r 'try .message // ""' 2>/dev/null)
+      detail=$(printf '%s' "$line" | jq -r 'try .detail // .path // ""' 2>/dev/null)
+      summary=$(first_collapsed_summary "$error_message" "$message" "$detail")
+
+      if [ -n "$summary" ]; then
+        progress "$(paint 31 "turn failed: $summary")"
+      else
+        progress "$(paint 31 "event: turn.failed")"
+      fi
       ;;
 
     turn.completed)

@@ -291,6 +291,60 @@ fn review_uses_bundled_default_agent_shim_when_config_is_missing() {
 }
 
 #[test]
+fn review_surfaces_nested_turn_failed_message_from_bundled_default_filter() {
+    let repo = TestRepo::new("bundled-default-turn-failed");
+    init_repo(repo.path());
+
+    write_file(
+        &repo.path().join("src/lib.rs"),
+        "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n",
+    );
+    commit_all(repo.path(), "initial");
+
+    create_and_checkout_branch(repo.path(), "feature");
+    write_file(
+        &repo.path().join("src/lib.rs"),
+        "pub fn add(a: i32, b: i32) -> i32 {\n    a + b + 1\n}\n",
+    );
+    commit_all(repo.path(), "feature changes");
+
+    checkout_branch(repo.path(), "main");
+
+    let bin_dir = repo.path().join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    codex_script_with_body(
+        &bin_dir,
+        "mkdir -p .anne-test\ncat >.anne-test/codex-stdin.bin\nprintf '%s\\n' '{\"type\":\"turn.failed\",\"error\":{\"message\":\"model refused\\nwith nested details\"}}'\nexit 23\n",
+    );
+    jq_script(&bin_dir);
+
+    let path_env = prepend_path(&bin_dir);
+    let output = anne_with_path(repo.path(), &["review", "main...feature"], Some(&path_env));
+    assert!(
+        !output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("turn failed: model refused with nested details"));
+    assert!(!stderr.contains("event: turn.failed"));
+
+    let bundle = bundle_path(repo.path(), &output.stdout);
+    let manifest = fs::read_to_string(bundle.join("manifest.json")).unwrap();
+    assert!(manifest.contains("\"status\": \"failed\""));
+    assert!(manifest.contains("\"progress_filter_ran\": true"));
+
+    let comments_md = fs::read_to_string(bundle.join("comments.md")).unwrap();
+    assert!(comments_md.contains("turn failed: model refused with nested details"));
+
+    let response = fs::read_to_string(bundle.join("agent/0001-src-lib.rs.response.txt")).unwrap();
+    assert!(response.contains("\"type\":\"turn.failed\""));
+    assert!(response.contains("model refused\\nwith nested details"));
+}
+
+#[test]
 fn review_skips_bundled_default_filter_when_jq_is_missing() {
     let repo = TestRepo::new("bundled-default-no-jq");
     init_repo(repo.path());
@@ -840,6 +894,31 @@ fn review_skips_pure_renames_from_git2_diff_data() {
 }
 
 #[test]
+fn default_filter_surfaces_nested_turn_failed_message() {
+    let repo = TestRepo::new("default-filter-turn-failed");
+    let bin_dir = repo.path().join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    jq_script(&bin_dir);
+
+    let input =
+        "{\"type\":\"turn.failed\",\"error\":{\"message\":\"model refused\\nwith nested details\"}}\n";
+    let output =
+        run_executable_with_stdin(&default_filter_script(), input, Some(&prepend_path(&bin_dir)));
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("turn failed: model refused with nested details"));
+    assert!(!stderr.contains("event: turn.failed"));
+}
+
+#[test]
 fn default_filter_uses_item_message_for_warning_fallback_and_preserves_last_payload() {
     let repo = TestRepo::new("default-filter-warning-fallback");
     let bin_dir = repo.path().join("bin");
@@ -1101,10 +1180,20 @@ fn filter_requires_jq_script(path: &Path) -> PathBuf {
 }
 
 fn codex_script(path: &Path) -> PathBuf {
+    codex_script_with_body(
+        path,
+        "mkdir -p .anne-test\ncat >.anne-test/codex-stdin.bin\nprintf '%s\\n' '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"[]\"}}'\n",
+    )
+}
+
+fn codex_script_with_body(path: &Path, body: &str) -> PathBuf {
     let script = path.join("codex");
     write_executable(
         &script,
-        "#!/usr/bin/env bash\nset -euo pipefail\n[ \"$1\" = \"exec\" ]\n[ \"$2\" = \"--json\" ]\n[ \"$3\" = \"-\" ]\nmkdir -p .anne-test\ncat >.anne-test/codex-stdin.bin\nprintf '%s\\n' '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"[]\"}}'\n",
+        &format!(
+            "#!/usr/bin/env bash\nset -euo pipefail\n[ \"$1\" = \"exec\" ]\n[ \"$2\" = \"--json\" ]\n[ \"$3\" = \"-\" ]\n{}",
+            body
+        ),
     );
     script
 }
@@ -1166,6 +1255,7 @@ def coalesce(*values):
 value = {
     'try .type // ""': get_path("type"),
     'try .thread_id // ""': get_path("thread_id"),
+    'try .error.message // ""': get_path("error", "message"),
     'try .item.type // ""': get_path("item", "type"),
     'try .item.text // ""': get_path("item", "text"),
     'try .item.message // ""': get_path("item", "message"),
