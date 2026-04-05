@@ -14,6 +14,7 @@ pub enum Command {
     Help(String),
     Review(ReviewRequest),
     Address(AddressRequest),
+    Filter,
 }
 
 pub fn parse(args: &[String]) -> Result<Command, String> {
@@ -25,6 +26,7 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
         "-h" | "--help" | "help" => Ok(Command::Help(root_help())),
         "review" => parse_review(&args[1..]),
         "address" => parse_address(&args[1..]),
+        "filter" => parse_filter(&args[1..]),
         other => Err(format!("unknown command `{other}`\n\n{}", root_help())),
     }
 }
@@ -133,9 +135,29 @@ fn parse_address(args: &[String]) -> Result<Command, String> {
     Ok(Command::Address(AddressRequest { comment_id }))
 }
 
+fn parse_filter(args: &[String]) -> Result<Command, String> {
+    if args.is_empty() {
+        return Ok(Command::Filter);
+    }
+
+    for arg in args {
+        match arg.as_str() {
+            "-h" | "--help" => return Ok(Command::Help(filter_help())),
+            value if value.starts_with("--") => {
+                return Err(format!("unknown flag `{value}`"));
+            }
+            _ => {
+                return Err("filter does not accept positional arguments".to_string());
+            }
+        }
+    }
+
+    Ok(Command::Filter)
+}
+
 fn root_help() -> String {
     format!(
-        "{binary}\n\nCommands:\n  review    Review <base>...<head> using merge-base semantics\n  address   Generate feature specs from the latest persisted review findings\n\nRun `{binary} review --help` or `{binary} address --help` for details.",
+        "{binary}\n\nCommands:\n  review    Review <base>...<head> using merge-base semantics\n  address   Generate feature specs from the latest persisted review findings\n  filter    Page through persisted review comments and optionally delete them\n\nRun `{binary} review --help`, `{binary} address --help`, or `{binary} filter --help` for details.",
         binary = "anne"
     )
 }
@@ -171,5 +193,26 @@ Notes:
   - Anne discovers review bundles at runtime under `.anne/reviews/`.
   - Without a comment id, Anne addresses all comments from the newest usable review bundle in stable id order.
   - With a comment id, Anne addresses exactly that comment from the newest usable review bundle."
+        .to_string()
+}
+
+fn filter_help() -> String {
+    "\
+anne filter
+
+Page through the current persisted review comments and optionally delete individual comments in place.
+
+Usage:
+  anne filter
+
+Keys:
+  n   keep the current comment and move to the next one
+  d   delete the current comment from the selected review bundle
+  q   quit immediately and keep the remaining comments unchanged
+
+Notes:
+  - Anne discovers review bundles at runtime under `.anne/reviews/`.
+  - Anne selects the newest usable persisted review bundle, preferring completed bundles over running ones.
+  - Each delete rewrites the selected bundle's `comments.json`, `comments.md`, and manifest counts immediately."
         .to_string()
 }

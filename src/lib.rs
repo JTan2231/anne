@@ -2,8 +2,10 @@ mod address;
 mod agent;
 mod cli;
 mod config;
+mod filter;
 mod git;
 mod json;
+mod persisted_review;
 mod review;
 mod util;
 
@@ -59,6 +61,27 @@ pub fn run_from_env() -> ExitCode {
                     }
                     ExitCode::from(1)
                 }
+            }
+            Err(error) => {
+                eprintln!("error: {error}");
+                ExitCode::from(1)
+            }
+        },
+        Ok(cli::Command::Filter) => match filter::run() {
+            Ok(result) => {
+                println!("Review bundle: {}", result.bundle_path);
+                println!("Comments loaded: {}", result.comments_loaded);
+                println!("Comments deleted: {}", result.comments_deleted);
+                println!("Comments remaining: {}", result.comments_remaining);
+                println!(
+                    "Filter status: {}",
+                    if result.completed {
+                        "completed"
+                    } else {
+                        "quit"
+                    }
+                );
+                ExitCode::SUCCESS
             }
             Err(error) => {
                 eprintln!("error: {error}");
@@ -157,5 +180,17 @@ mod tests {
         .unwrap_err();
 
         assert!(error.contains("at most one positional <comment-id>"));
+    }
+
+    #[test]
+    fn parses_filter_without_args() {
+        let command = cli::parse(&["filter".to_string()]).unwrap();
+        assert_eq!(command, Command::Filter);
+    }
+
+    #[test]
+    fn rejects_filter_positional_args() {
+        let error = cli::parse(&["filter".to_string(), "R001".to_string()]).unwrap_err();
+        assert!(error.contains("does not accept positional arguments"));
     }
 }

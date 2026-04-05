@@ -341,11 +341,7 @@ fn install_sh_requires_writable_prefix() -> TestResult {
     perms.set_mode(0o555);
     fs::set_permissions(&prefix, perms)?;
 
-    let output = run_install_sh(
-        &root,
-        &[],
-        &[("PREFIX", prefix.as_os_str())],
-    )?;
+    let output = run_install_sh(&root, &[], &[("PREFIX", prefix.as_os_str())])?;
     assert!(
         !output.status.success(),
         "expected install.sh to fail for unwritable prefix: status={:?}\nstdout={}\nstderr={}",
