@@ -600,12 +600,24 @@ fn review_skips_pure_renames_from_git2_diff_data() {
 }
 
 #[test]
-fn repository_code_and_scripts_do_not_invoke_git_cli() {
+fn tracked_src_and_tests_rust_files_and_shell_scripts_do_not_invoke_git_cli() {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut files = Vec::new();
-    collect_files(&repo_root.join("src"), "rs", &mut files);
-    collect_files(&repo_root.join("tests"), "rs", &mut files);
-    files.push(repo_root.join("ci.sh"));
+    let files = tracked_git_cli_guard_files(repo_root);
+    let (rust_files, shell_files): (Vec<_>, Vec<_>) = files
+        .into_iter()
+        .partition(|path| path.extension().and_then(|ext| ext.to_str()) == Some("rs"));
+
+    for expected in [
+        Path::new("ci.sh"),
+        Path::new("examples/agents/default/agent.sh"),
+        Path::new("examples/agents/default/filter.sh"),
+    ] {
+        assert!(
+            shell_files.iter().any(|path| path == expected),
+            "tracked shell guard unexpectedly omitted {}",
+            expected.display()
+        );
+    }
 
     let double_quote = "\"";
     let single_quote = "'";
@@ -615,30 +627,29 @@ fn repository_code_and_scripts_do_not_invoke_git_cli() {
         format!("Command::new({double_quote}/usr/bin/git{double_quote})"),
     ];
 
-    for file in files {
-        let contents = fs::read_to_string(&file).unwrap();
-
+    for file in rust_files {
+        let contents = fs::read_to_string(repo_root.join(&file)).unwrap();
         for pattern in &forbidden_command_patterns {
             assert!(
                 !contents.contains(pattern),
-                "forbidden Git CLI invocation pattern `{pattern}` found in {}",
+                "forbidden Git CLI invocation pattern `{pattern}` found in tracked Rust file {}",
                 file.display()
             );
         }
+    }
 
-        if file.extension().and_then(|ext| ext.to_str()) == Some("sh") {
-            for (index, line) in contents.lines().enumerate() {
-                let trimmed = line.trim_start();
-                let starts_git = trimmed.starts_with("git ") || trimmed.starts_with("git\t");
-                let execs_git =
-                    trimmed.starts_with("exec git ") || trimmed.starts_with("exec git\t");
-                assert!(
-                    !starts_git && !execs_git,
-                    "forbidden shell Git CLI invocation in {}:{}",
-                    file.display(),
-                    index + 1
-                );
-            }
+    for file in shell_files {
+        let contents = fs::read_to_string(repo_root.join(&file)).unwrap();
+        for (index, line) in contents.lines().enumerate() {
+            let trimmed = line.trim_start();
+            let starts_git = trimmed.starts_with("git ") || trimmed.starts_with("git\t");
+            let execs_git = trimmed.starts_with("exec git ") || trimmed.starts_with("exec git\t");
+            assert!(
+                !starts_git && !execs_git,
+                "forbidden shell Git CLI invocation found in tracked shell file {}:{}",
+                file.display(),
+                index + 1
+            );
         }
     }
 }
@@ -926,20 +937,35 @@ fn head_commit(repo: &Repository) -> git2::Commit<'_> {
     repo.find_commit(oid).unwrap()
 }
 
-fn collect_files(root: &Path, extension: &str, files: &mut Vec<PathBuf>) {
-    if !root.exists() {
-        return;
-    }
+fn tracked_git_cli_guard_files(repo_root: &Path) -> Vec<PathBuf> {
+    let repo = Repository::open(repo_root).unwrap_or_else(|error| {
+        panic!(
+            "failed opening repository at {}: {error}",
+            repo_root.display()
+        )
+    });
+    let index = repo.index().unwrap_or_else(|error| {
+        panic!(
+            "failed loading repository index at {}: {error}",
+            repo_root.display()
+        )
+    });
+    let mut files = index
+        .iter()
+        .filter_map(|entry| {
+            let path = PathBuf::from(String::from_utf8_lossy(&entry.path).into_owned());
+            tracked_git_cli_guard_path(&path).then_some(path)
+        })
+        .collect::<Vec<_>>();
+    files.sort();
+    files
+}
 
-    for entry in fs::read_dir(root).unwrap() {
-        let entry = entry.unwrap();
-        let path = entry.path();
-        let file_type = entry.file_type().unwrap();
-        if file_type.is_dir() {
-            collect_files(&path, extension, files);
-        } else if path.extension().and_then(|ext| ext.to_str()) == Some(extension) {
-            files.push(path);
-        }
+fn tracked_git_cli_guard_path(path: &Path) -> bool {
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some("rs") => path.starts_with("src") || path.starts_with("tests"),
+        Some("sh") => true,
+        _ => false,
     }
 }
 

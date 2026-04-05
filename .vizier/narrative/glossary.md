@@ -11,3 +11,4 @@
 - Agent workers: The `[agent].workers` configuration value that bounds concurrent per-file review jobs and per-comment address jobs. Anne defaults it to `4`, and `1` disables parallel fan-out.
 - Progress filter: An optional command configured under `[agent].progress_filter` that receives agent stdout on stdin and emits the final assistant text on stdout while using stderr for progress/logging. `review` uses that text as findings JSON; `address` uses it as markdown spec text.
 - Validated finding: A structured review comment whose `path`, `side`, and `line` match an actual changed line in the reviewed patch and therefore can be safely published into `comments.json` and `comments.md`.
+- Tracked Git CLI guard: The review test that enumerates tracked `src/**/*.rs`, tracked `tests/**/*.rs`, and tracked `*.sh` paths from the repository index, then fails on direct `Command::new("git")`-style Rust subprocess construction or direct shell `git` / `exec git` entrypoints.
