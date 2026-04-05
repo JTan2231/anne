@@ -1,0 +1,16 @@
+{
+  "plan_id": "pln_31f8cd8b92014c2fb4819f3e2f992440",
+  "slug": "r016-the-loader-overwrites-an-ex",
+  "branch": "draft/r016-the-loader-overwrites-an-ex",
+  "source": "inline",
+  "intent": null,
+  "target_branch": null,
+  "work_ref": "workflow-job:wf-run_ef847e57bf4543e0aad11cd3e745ca70-develop_draft__persist_plan",
+  "status": "proposed",
+  "summary": "Anne should stop mutating explicit agent.output declarations during config load. This change primarily affects teams...",
+  "created_at": "2026-04-05T05:44:34.606861324+00:00",
+  "updated_at": "2026-04-05T05:44:34.606861324+00:00",
+  "job_ids": {
+    "persist": "wf-run_ef847e57bf4543e0aad11cd3e745ca70-develop_draft__persist_plan"
+  }
+}

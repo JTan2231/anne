@@ -811,6 +811,85 @@ EOF
 }
 
 #[test]
+fn address_preserves_explicit_text_output_with_custom_filter() {
+    let repo = TestRepo::new("explicit-text-custom-filter");
+    init_repo(repo.path());
+    write_init_template(repo.path());
+
+    let agent = agent_script(
+        repo.path(),
+        r#"cat >/dev/null
+printf 'thinking\n'
+cat <<'EOF'
+FINAL-BEGIN
+# Anne
+
+## Feature: Explicit text runtime
+
+### Problem
+
+Anne must preserve the declared text runtime when a custom filter is configured.
+
+### Goals
+
+- Keep manifest runtime metadata aligned with the explicit config.
+
+### Non-Goals
+
+- Inferring wrapped-json from filter presence alone.
+
+## Proposed Approach
+
+Generate the spec through the custom filter without rewriting the output mode.
+FINAL-END
+EOF
+"#,
+    );
+    let filter = markdown_filter_script(repo.path());
+    write_agent_config(repo.path(), "text", &agent, Some(&filter));
+
+    write_review_bundle(
+        repo.path(),
+        "2026-04-04T12-45-00Z-explicit-text-custom-filter",
+        Some("2026-04-04T12:45:00Z"),
+        &[ReviewCommentSpec {
+            id: "R001",
+            path: "src/lib.rs",
+            side: "new",
+            line: 2,
+            severity: "warning",
+            title: "Text title",
+            body: "Text body.",
+            hunk_header: Some("@@ -1,1 +1,2 @@"),
+            patch_file: Some("files/0001-src-lib.rs.patch"),
+        }],
+    );
+
+    let output = anne(repo.path(), &["address"]);
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let bundle = address_bundle_path(repo.path(), &output.stdout);
+    let manifest = fs::read_to_string(bundle.join("manifest.json")).unwrap();
+    assert!(manifest.contains("\"status\": \"succeeded\""));
+    assert!(manifest.contains("\"output\": \"text\""));
+    assert!(manifest.contains("\"effective_output\": \"text\""));
+    assert!(manifest.contains("\"progress_filter_source\": \"explicit\""));
+    assert!(manifest.contains("\"assistant_text_source\": \"progress-filter\""));
+    assert!(!manifest.contains("\"output\": \"wrapped-json\""));
+
+    let response = fs::read_to_string(bundle.join("agent/R001.response.txt")).unwrap();
+    assert!(response.contains("FINAL-BEGIN"));
+
+    let spec = fs::read_to_string(bundle.join("specs/R001-Text-title.md")).unwrap();
+    assert!(spec.contains("## Feature: Explicit text runtime"));
+}
+
+#[test]
 fn address_rejects_headingless_response_but_continues_later_comments() {
     let repo = TestRepo::new("headingless-response");
     init_repo(repo.path());

@@ -36,6 +36,7 @@ pub struct AgentConfig {
     pub progress_filter: Vec<String>,
     pub progress_filter_source: AgentSettingSource,
     pub output: AgentOutput,
+    output_source: AgentSettingSource,
     pub enable_script_wrapper: bool,
     pub workers: usize,
 }
@@ -49,6 +50,7 @@ impl Default for AgentConfig {
             progress_filter: Vec::new(),
             progress_filter_source: AgentSettingSource::None,
             output: AgentOutput::default(),
+            output_source: AgentSettingSource::None,
             enable_script_wrapper: false,
             workers: 4,
         }
@@ -116,11 +118,11 @@ impl AgentConfig {
             self.progress_filter_source = AgentSettingSource::Explicit;
         }
 
-        if self.output == AgentOutput::Text
-            && (self.command_source == AgentSettingSource::BundledDefault
-                || (!self.command.is_empty() && !self.progress_filter.is_empty()))
+        if self.output_source == AgentSettingSource::None
+            && self.command_source == AgentSettingSource::BundledDefault
         {
             self.output = AgentOutput::WrappedJson;
+            self.output_source = AgentSettingSource::BundledDefault;
         }
     }
 }
@@ -194,6 +196,7 @@ fn parse_config(text: &str) -> Result<AppConfig, String> {
                     "wrapped-json" => AgentOutput::WrappedJson,
                     other => return Err(format!("unsupported agent.output `{other}`")),
                 };
+                config.agent.output_source = AgentSettingSource::Explicit;
             }
             ("agent", "enable_script_wrapper") => {
                 config.agent.enable_script_wrapper = parse_bool(value)?
@@ -461,5 +464,61 @@ workers = 0
         assert_eq!(config.agent.output, AgentOutput::WrappedJson);
 
         let _ = fs::remove_dir_all(repo_root);
+    }
+
+    #[test]
+    fn explicit_text_output_survives_load_with_custom_filter() {
+        let repo_root = unique_repo_root("anne-config-explicit-text-filter");
+        fs::create_dir_all(repo_root.join(".anne")).unwrap();
+        fs::write(
+            repo_root.join(".anne/config.toml"),
+            "[agent]\ncommand = [\"./agent.sh\"]\nprogress_filter = [\"./filter.sh\"]\noutput = \"text\"\n",
+        )
+        .unwrap();
+
+        let config = AppConfig::load(&repo_root).unwrap();
+
+        assert_eq!(config.agent.command, vec!["./agent.sh"]);
+        assert_eq!(config.agent.command_source, AgentSettingSource::Explicit);
+        assert_eq!(config.agent.progress_filter, vec!["./filter.sh"]);
+        assert_eq!(
+            config.agent.progress_filter_source,
+            AgentSettingSource::Explicit
+        );
+        assert_eq!(config.agent.output, AgentOutput::Text);
+
+        let _ = fs::remove_dir_all(repo_root);
+    }
+
+    #[test]
+    fn omitted_output_with_custom_filter_stays_text() {
+        let repo_root = unique_repo_root("anne-config-implicit-text-filter");
+        fs::create_dir_all(repo_root.join(".anne")).unwrap();
+        fs::write(
+            repo_root.join(".anne/config.toml"),
+            "[agent]\ncommand = [\"./agent.sh\"]\nprogress_filter = [\"./filter.sh\"]\n",
+        )
+        .unwrap();
+
+        let config = AppConfig::load(&repo_root).unwrap();
+
+        assert_eq!(config.agent.command, vec!["./agent.sh"]);
+        assert_eq!(config.agent.command_source, AgentSettingSource::Explicit);
+        assert_eq!(config.agent.progress_filter, vec!["./filter.sh"]);
+        assert_eq!(
+            config.agent.progress_filter_source,
+            AgentSettingSource::Explicit
+        );
+        assert_eq!(config.agent.output, AgentOutput::Text);
+
+        let _ = fs::remove_dir_all(repo_root);
+    }
+
+    fn unique_repo_root(prefix: &str) -> std::path::PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}-{}-{unique}", std::process::id()))
     }
 }

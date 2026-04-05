@@ -475,6 +475,56 @@ ignore_prefixes = [\"vendor/\"]
 }
 
 #[test]
+fn review_preserves_explicit_text_output_with_custom_filter() {
+    let repo = TestRepo::new("explicit-text-custom-filter");
+    init_repo(repo.path());
+
+    write_file(
+        &repo.path().join("src/lib.rs"),
+        "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n",
+    );
+    commit_all(repo.path(), "initial");
+
+    create_and_checkout_branch(repo.path(), "feature");
+    write_file(
+        &repo.path().join("src/lib.rs"),
+        "pub fn add(a: i32, b: i32) -> i32 {\n    a + b + 1\n}\n",
+    );
+    commit_all(repo.path(), "feature changes");
+
+    checkout_branch(repo.path(), "main");
+
+    let agent = agent_script(
+        repo.path(),
+        "while IFS= read -r _line; do :; done\nprintf 'thinking\\n'\nprintf 'FINAL:[{\"path\":\"src/lib.rs\",\"side\":\"new\",\"line\":2,\"severity\":\"warning\",\"title\":\"Text output preserved\",\"body\":\"Anne should keep the explicit text runtime when a custom filter is present.\"}]\\n'\n",
+    );
+    let filter = filter_script(repo.path());
+    write_agent_config(repo.path(), "text", &agent, Some(&filter));
+
+    let output = anne(repo.path(), &["review", "main...feature"]);
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let bundle = bundle_path(repo.path(), &output.stdout);
+    let comments_json = fs::read_to_string(bundle.join("comments.json")).unwrap();
+    assert!(comments_json.contains("\"title\": \"Text output preserved\""));
+
+    let manifest = fs::read_to_string(bundle.join("manifest.json")).unwrap();
+    assert!(manifest.contains("\"output\": \"text\""));
+    assert!(manifest.contains("\"effective_output\": \"text\""));
+    assert!(manifest.contains("\"progress_filter_source\": \"explicit\""));
+    assert!(manifest.contains("\"assistant_text_source\": \"progress-filter\""));
+    assert!(!manifest.contains("\"output\": \"wrapped-json\""));
+
+    let response = fs::read_to_string(bundle.join("agent/0001-src-lib.rs.response.txt")).unwrap();
+    assert!(response.contains("FINAL:[{"));
+}
+
+#[test]
 fn review_preserves_bundle_path_when_final_output_write_fails() {
     let repo = TestRepo::new("output-write-failure");
     init_repo(repo.path());
@@ -974,10 +1024,12 @@ fn default_filter_surfaces_nested_turn_failed_message() {
     fs::create_dir_all(&bin_dir).unwrap();
     jq_script(&bin_dir);
 
-    let input =
-        "{\"type\":\"turn.failed\",\"error\":{\"message\":\"model refused\\nwith nested details\"}}\n";
-    let output =
-        run_executable_with_stdin(&default_filter_script(), input, Some(&prepend_path(&bin_dir)));
+    let input = "{\"type\":\"turn.failed\",\"error\":{\"message\":\"model refused\\nwith nested details\"}}\n";
+    let output = run_executable_with_stdin(
+        &default_filter_script(),
+        input,
+        Some(&prepend_path(&bin_dir)),
+    );
     assert!(
         output.status.success(),
         "stdout:\n{}\nstderr:\n{}",
@@ -1003,8 +1055,11 @@ fn default_filter_uses_item_message_for_warning_fallback_and_preserves_last_payl
         "{\"type\":\"item.completed\",\"item\":{\"type\":\"error\",\"message\":\"warning payload\\nfrom item.message\"}}\n",
         "{\"type\":\"item.completed\",\"item\":{\"type\":\"error\"}}\n",
     );
-    let output =
-        run_executable_with_stdin(&default_filter_script(), input, Some(&prepend_path(&bin_dir)));
+    let output = run_executable_with_stdin(
+        &default_filter_script(),
+        input,
+        Some(&prepend_path(&bin_dir)),
+    );
     assert!(
         output.status.success(),
         "stdout:\n{}\nstderr:\n{}",
@@ -1033,8 +1088,11 @@ fn default_filter_keeps_final_agent_message_over_warning_fallback() {
         "{\"type\":\"item.completed\",\"item\":{\"type\":\"error\",\"message\":\"warning payload\"}}\n",
         "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"[]\"}}\n",
     );
-    let output =
-        run_executable_with_stdin(&default_filter_script(), input, Some(&prepend_path(&bin_dir)));
+    let output = run_executable_with_stdin(
+        &default_filter_script(),
+        input,
+        Some(&prepend_path(&bin_dir)),
+    );
     assert!(
         output.status.success(),
         "stdout:\n{}\nstderr:\n{}",
