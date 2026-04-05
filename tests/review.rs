@@ -1500,6 +1500,59 @@ fn default_filter_keeps_final_agent_message_over_warning_fallback() {
 }
 
 #[test]
+fn bundled_default_fake_jq_keeps_supported_queries_narrow_and_explicit() {
+    let repo = TestRepo::new("bundled-default-fake-jq-contract");
+    let bin_dir = repo.path().join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let jq = jq_script(&bin_dir);
+
+    let usage = run_executable_with_args_and_stdin(
+        &jq,
+        &["-r", "try (.usage.total_tokens // .usage.total) // \"\""],
+        "{\"type\":\"turn.completed\",\"usage\":{\"total\":42}}\n",
+        None,
+    );
+    assert!(
+        usage.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&usage.stdout),
+        String::from_utf8_lossy(&usage.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&usage.stdout), "42\n");
+
+    let missing = run_executable_with_args_and_stdin(
+        &jq,
+        &["-r", "try .item.message // \"\""],
+        "{\"type\":\"item.completed\",\"item\":{\"type\":\"error\"}}\n",
+        None,
+    );
+    assert!(
+        missing.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&missing.stdout),
+        String::from_utf8_lossy(&missing.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&missing.stdout), "\n");
+
+    let unsupported = run_executable_with_args_and_stdin(
+        &jq,
+        &["-r", "try .item.id // \"\""],
+        "{\"type\":\"item.completed\",\"item\":{\"type\":\"error\"}}\n",
+        None,
+    );
+    assert!(
+        !unsupported.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&unsupported.stdout),
+        String::from_utf8_lossy(&unsupported.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&unsupported.stderr)
+            .contains("unsupported jq expression: try .item.id // \"\"")
+    );
+}
+
+#[test]
 fn repo_layout_rust_and_shell_files_do_not_invoke_git_cli() {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let files = repo_layout_git_cli_guard_files(repo_root).unwrap();
@@ -1823,76 +1876,409 @@ fn jq_script(path: &Path) -> PathBuf {
     let script = path.join("jq");
     write_executable(
         &script,
-        r#"#!/usr/bin/env bash
+        r###"#!/usr/bin/env bash
 set -euo pipefail
-[ "$1" = "-r" ]
+
+die() {
+  printf 'anne test jq stub: %s\n' "$1" >&2
+  exit 1
+}
+
+if [ "$#" -ne 2 ] || [ "$1" != "-r" ]; then
+  die "unsupported jq invocation: $*"
+fi
+
 expr="$2"
-input=$(cat)
-export ANNE_TEST_JQ_INPUT="$input"
-python3 - "$expr" <<'PY'
-import json
-import os
-import sys
+json_input=$(cat)
+json_pos=0
+json_len=${#json_input}
+json_result_value=""
 
-expr = sys.argv[1]
-data = json.loads(os.environ["ANNE_TEST_JQ_INPUT"])
+skip_ws() {
+  while [ "$json_pos" -lt "$json_len" ]; do
+    case "${json_input:$json_pos:1}" in
+      ' '|$'\t'|$'\n'|$'\r')
+        json_pos=$((json_pos + 1))
+        ;;
+      *)
+        return
+        ;;
+    esac
+  done
+}
 
-def get_path(*parts):
-    value = data
-    for part in parts:
-        if not isinstance(value, dict) or part not in value:
-            return None
-        value = value[part]
-    return value
+peek_char() {
+  printf '%s' "${json_input:$json_pos:1}"
+}
 
-def coalesce(*values):
-    for value in values:
-        if value is not None:
-            return value
-    return ""
+parse_string() {
+  local out="" ch esc hex decoded
+  [ "$(peek_char)" = '"' ] || die "expected string at offset $json_pos while evaluating '$expr'"
+  json_pos=$((json_pos + 1))
 
-value = {
-    'try .type // ""': get_path("type"),
-    'try .thread_id // ""': get_path("thread_id"),
-    'try .error.message // ""': get_path("error", "message"),
-    'try .item.type // ""': get_path("item", "type"),
-    'try .item.text // ""': get_path("item", "text"),
-    'try .item.message // ""': get_path("item", "message"),
-    'try .item.status // ""': get_path("item", "status"),
-    'try (.item.progress // .progress) // ""': coalesce(
-        get_path("item", "progress"),
-        get_path("progress"),
-    ),
-    'try .item.command // ""': get_path("item", "command"),
-    'try .item.exit_code // ""': get_path("item", "exit_code"),
-    'try (.usage.input_tokens // .usage.prompt_tokens) // ""': coalesce(
-        get_path("usage", "input_tokens"),
-        get_path("usage", "prompt_tokens"),
-    ),
-    'try .usage.cached_input_tokens // ""': get_path("usage", "cached_input_tokens"),
-    'try (.usage.output_tokens // .usage.completion_tokens) // ""': coalesce(
-        get_path("usage", "output_tokens"),
-        get_path("usage", "completion_tokens"),
-    ),
-    'try .usage.reasoning_output_tokens // ""': get_path("usage", "reasoning_output_tokens"),
-    'try (.usage.total_tokens // .usage.total) // ""': coalesce(
-        get_path("usage", "total_tokens"),
-        get_path("usage", "total"),
-    ),
-    'try (.phase // .label) // ""': coalesce(get_path("phase"), get_path("label")),
-    'try .message // ""': get_path("message"),
-    'try .detail // .path // ""': coalesce(get_path("detail"), get_path("path")),
-}.get(expr, "")
+  while [ "$json_pos" -lt "$json_len" ]; do
+    ch="$(peek_char)"
+    if [ "$ch" = '"' ]; then
+      json_pos=$((json_pos + 1))
+      REPLY="$out"
+      return 0
+    fi
+    if [ "$ch" = '\' ]; then
+      json_pos=$((json_pos + 1))
+      [ "$json_pos" -lt "$json_len" ] || die "unterminated escape at offset $json_pos while evaluating '$expr'"
+      esc="$(peek_char)"
+      case "$esc" in
+        '"'|'\'|'/')
+          out+="$esc"
+          ;;
+        b)
+          out+=$'\b'
+          ;;
+        f)
+          out+=$'\f'
+          ;;
+        n)
+          out+=$'\n'
+          ;;
+        r)
+          out+=$'\r'
+          ;;
+        t)
+          out+=$'\t'
+          ;;
+        u)
+          hex="${json_input:$((json_pos + 1)):4}"
+          if ! [[ "$hex" =~ ^[0-9A-Fa-f]{4}$ ]]; then
+            die "unsupported unicode escape at offset $json_pos while evaluating '$expr'"
+          fi
+          printf -v decoded '%b' "\\u$hex"
+          out+="$decoded"
+          json_pos=$((json_pos + 4))
+          ;;
+        *)
+          die "unsupported escape \\$esc at offset $json_pos while evaluating '$expr'"
+          ;;
+      esac
+      json_pos=$((json_pos + 1))
+      continue
+    fi
+    out+="$ch"
+    json_pos=$((json_pos + 1))
+  done
 
-if value is None:
-    value = ""
+  die "unterminated string while evaluating '$expr'"
+}
 
-if isinstance(value, bool):
-    print("true" if value else "false")
-else:
-    print(value)
-PY
-"#,
+parse_literal() {
+  local expected="$1"
+  local width=${#expected}
+  if [ "${json_input:$json_pos:$width}" != "$expected" ]; then
+    die "expected $expected at offset $json_pos while evaluating '$expr'"
+  fi
+  json_pos=$((json_pos + width))
+  REPLY="$expected"
+}
+
+parse_number() {
+  local start="$json_pos" ch
+  while [ "$json_pos" -lt "$json_len" ]; do
+    ch="$(peek_char)"
+    case "$ch" in
+      ' '|$'\t'|$'\n'|$'\r'|','|'}'|']')
+        break
+        ;;
+      *)
+        json_pos=$((json_pos + 1))
+        ;;
+    esac
+  done
+
+  [ "$json_pos" -gt "$start" ] || die "expected number at offset $json_pos while evaluating '$expr'"
+  REPLY="${json_input:$start:$((json_pos - start))}"
+  if ! [[ "$REPLY" =~ ^-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?$ ]]; then
+    die "invalid number '$REPLY' while evaluating '$expr'"
+  fi
+}
+
+skip_value() {
+  skip_ws
+  case "$(peek_char)" in
+    '{')
+      skip_object
+      ;;
+    '[')
+      skip_array
+      ;;
+    '"')
+      parse_string
+      ;;
+    t)
+      parse_literal "true"
+      ;;
+    f)
+      parse_literal "false"
+      ;;
+    n)
+      parse_literal "null"
+      ;;
+    -|[0-9])
+      parse_number
+      ;;
+    "")
+      die "unexpected end of input while evaluating '$expr'"
+      ;;
+    *)
+      die "unexpected token '$(peek_char)' at offset $json_pos while evaluating '$expr'"
+      ;;
+  esac
+}
+
+skip_object() {
+  [ "$(peek_char)" = '{' ] || die "expected object at offset $json_pos while evaluating '$expr'"
+  json_pos=$((json_pos + 1))
+  skip_ws
+
+  if [ "$(peek_char)" = '}' ]; then
+    json_pos=$((json_pos + 1))
+    return 0
+  fi
+
+  while :; do
+    parse_string
+    skip_ws
+    [ "$(peek_char)" = ':' ] || die "expected ':' at offset $json_pos while evaluating '$expr'"
+    json_pos=$((json_pos + 1))
+    skip_value
+    skip_ws
+
+    case "$(peek_char)" in
+      ',')
+        json_pos=$((json_pos + 1))
+        skip_ws
+        ;;
+      '}')
+        json_pos=$((json_pos + 1))
+        return 0
+        ;;
+      *)
+        die "expected ',' or '}' at offset $json_pos while evaluating '$expr'"
+        ;;
+    esac
+  done
+}
+
+skip_array() {
+  [ "$(peek_char)" = '[' ] || die "expected array at offset $json_pos while evaluating '$expr'"
+  json_pos=$((json_pos + 1))
+  skip_ws
+
+  if [ "$(peek_char)" = ']' ]; then
+    json_pos=$((json_pos + 1))
+    return 0
+  fi
+
+  while :; do
+    skip_value
+    skip_ws
+
+    case "$(peek_char)" in
+      ',')
+        json_pos=$((json_pos + 1))
+        skip_ws
+        ;;
+      ']')
+        json_pos=$((json_pos + 1))
+        return 0
+        ;;
+      *)
+        die "expected ',' or ']' at offset $json_pos while evaluating '$expr'"
+        ;;
+    esac
+  done
+}
+
+json_find_key() {
+  local target="$1" key
+  skip_ws
+  [ "$(peek_char)" = '{' ] || die "expected object while looking up '$target' for '$expr'"
+  json_pos=$((json_pos + 1))
+  skip_ws
+
+  if [ "$(peek_char)" = '}' ]; then
+    json_pos=$((json_pos + 1))
+    return 1
+  fi
+
+  while :; do
+    parse_string
+    key="$REPLY"
+    skip_ws
+    [ "$(peek_char)" = ':' ] || die "expected ':' at offset $json_pos while evaluating '$expr'"
+    json_pos=$((json_pos + 1))
+    skip_ws
+
+    if [ "$key" = "$target" ]; then
+      return 0
+    fi
+
+    skip_value
+    skip_ws
+
+    case "$(peek_char)" in
+      ',')
+        json_pos=$((json_pos + 1))
+        skip_ws
+        ;;
+      '}')
+        json_pos=$((json_pos + 1))
+        return 1
+        ;;
+      *)
+        die "expected ',' or '}' at offset $json_pos while evaluating '$expr'"
+        ;;
+    esac
+  done
+}
+
+capture_scalar() {
+  skip_ws
+  case "$(peek_char)" in
+    '"')
+      parse_string
+      json_result_value="$REPLY"
+      return 0
+      ;;
+    t)
+      parse_literal "true"
+      json_result_value="$REPLY"
+      return 0
+      ;;
+    f)
+      parse_literal "false"
+      json_result_value="$REPLY"
+      return 1
+      ;;
+    n)
+      parse_literal "null"
+      json_result_value=""
+      return 1
+      ;;
+    -|[0-9])
+      parse_number
+      json_result_value="$REPLY"
+      return 0
+      ;;
+    '{'|'[')
+      die "query '$expr' resolved to non-scalar JSON"
+      ;;
+    "")
+      die "unexpected end of input while evaluating '$expr'"
+      ;;
+    *)
+      die "unexpected token '$(peek_char)' at offset $json_pos while evaluating '$expr'"
+      ;;
+  esac
+}
+
+lookup_path() {
+  local segment
+  json_pos=0
+  for segment in "$@"; do
+    if ! json_find_key "$segment"; then
+      json_result_value=""
+      return 1
+    fi
+  done
+
+  if capture_scalar; then
+    return 0
+  fi
+  return 1
+}
+
+emit_path() {
+  if lookup_path "$@"; then
+    printf '%s\n' "$json_result_value"
+  else
+    printf '\n'
+  fi
+}
+
+emit_first_available() {
+  local path_spec
+  local -a segments
+  for path_spec in "$@"; do
+    IFS='.' read -r -a segments <<< "$path_spec"
+    if lookup_path "${segments[@]}"; then
+      printf '%s\n' "$json_result_value"
+      return 0
+    fi
+  done
+  printf '\n'
+}
+
+# Keep this whitelist aligned with examples/agents/default/filter.sh, which is
+# the source of truth for bundled-default jq queries in review tests.
+case "$expr" in
+  'try .type // ""')
+    emit_path type
+    ;;
+  'try .thread_id // ""')
+    emit_path thread_id
+    ;;
+  'try .error.message // ""')
+    emit_path error message
+    ;;
+  'try .item.type // ""')
+    emit_path item type
+    ;;
+  'try .item.text // ""')
+    emit_path item text
+    ;;
+  'try .item.message // ""')
+    emit_path item message
+    ;;
+  'try .item.status // ""')
+    emit_path item status
+    ;;
+  'try (.item.progress // .progress) // ""')
+    emit_first_available item.progress progress
+    ;;
+  'try .item.command // ""')
+    emit_path item command
+    ;;
+  'try .item.exit_code // ""')
+    emit_path item exit_code
+    ;;
+  'try (.usage.input_tokens // .usage.prompt_tokens) // ""')
+    emit_first_available usage.input_tokens usage.prompt_tokens
+    ;;
+  'try .usage.cached_input_tokens // ""')
+    emit_path usage cached_input_tokens
+    ;;
+  'try (.usage.output_tokens // .usage.completion_tokens) // ""')
+    emit_first_available usage.output_tokens usage.completion_tokens
+    ;;
+  'try .usage.reasoning_output_tokens // ""')
+    emit_path usage reasoning_output_tokens
+    ;;
+  'try (.usage.total_tokens // .usage.total) // ""')
+    emit_first_available usage.total_tokens usage.total
+    ;;
+  'try (.phase // .label) // ""')
+    emit_first_available phase label
+    ;;
+  'try .message // ""')
+    emit_path message
+    ;;
+  'try .detail // .path // ""')
+    emit_first_available detail path
+    ;;
+  *)
+    die "unsupported jq expression: $expr"
+    ;;
+esac
+"###,
     );
     script
 }
@@ -1999,9 +2385,14 @@ fn spawn_anne_with_path(path: &Path, args: &[&str], path_env: Option<&str>) -> C
         .unwrap()
 }
 
-fn run_executable_with_stdin(executable: &Path, input: &str, path_env: Option<&str>) -> Output {
+fn run_executable_with_args_and_stdin(
+    executable: &Path,
+    args: &[&str],
+    input: &str,
+    path_env: Option<&str>,
+) -> Output {
     let mut command = Command::new(executable);
-    command.current_dir(env!("CARGO_MANIFEST_DIR"));
+    command.args(args).current_dir(env!("CARGO_MANIFEST_DIR"));
     if let Some(path_env) = path_env {
         command.env("PATH", path_env);
     }
@@ -2017,6 +2408,10 @@ fn run_executable_with_stdin(executable: &Path, input: &str, path_env: Option<&s
     }
     drop(child.stdin.take());
     child.wait_with_output().unwrap()
+}
+
+fn run_executable_with_stdin(executable: &Path, input: &str, path_env: Option<&str>) -> Output {
+    run_executable_with_args_and_stdin(executable, &[], input, path_env)
 }
 
 fn wait_for(label: &str, predicate: impl Fn() -> bool) {
