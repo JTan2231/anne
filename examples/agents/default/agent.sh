@@ -1,13 +1,28 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Read stdin once so we can log what we are sending to Codex.
-prompt=$(cat)
-if [ -z "$prompt" ]; then
+prompt_file=$(
+  mktemp "${TMPDIR:-/tmp}/anne-default-agent.XXXXXX"
+) || {
+  printf '[default shim] failed creating prompt staging file\n' >&2
+  exit 1
+}
+
+cleanup() {
+  rm -f "$prompt_file"
+}
+trap cleanup EXIT
+
+if ! cat >"$prompt_file"; then
+  printf '[default shim] failed staging prompt bytes\n' >&2
+  exit 1
+fi
+
+if [ ! -s "$prompt_file" ]; then
   printf '[default shim] prompt: <empty>\n' >&2
 else
-  first_line=${prompt%%$'\n'*}
+  IFS= read -r first_line <"$prompt_file" || true
   printf '[default shim] prompt (first line preview): %s\n' "$first_line" >&2
 fi
 
-printf '%s' "$prompt" | codex exec --json -
+codex exec --json - <"$prompt_file"

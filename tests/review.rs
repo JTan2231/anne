@@ -265,6 +265,14 @@ fn review_uses_bundled_default_agent_shim_when_config_is_missing() {
     );
 
     let bundle = bundle_path(repo.path(), &output.stdout);
+    let captured_prompt = fs::read(repo.path().join(".anne-test/codex-stdin.bin")).unwrap();
+    let persisted_prompt = fs::read(bundle.join("agent/0001-src-lib.rs.prompt.md")).unwrap();
+    assert!(
+        persisted_prompt.ends_with(b"\n"),
+        "review prompt artifact unexpectedly omitted a trailing newline"
+    );
+    assert_eq!(captured_prompt, persisted_prompt);
+
     let comments_json = fs::read_to_string(bundle.join("comments.json")).unwrap();
     assert_eq!(comments_json.trim(), "[]");
 
@@ -880,7 +888,7 @@ fn codex_script(path: &Path) -> PathBuf {
     let script = path.join("codex");
     write_executable(
         &script,
-        "#!/usr/bin/env bash\nset -euo pipefail\n[ \"$1\" = \"exec\" ]\n[ \"$2\" = \"--json\" ]\n[ \"$3\" = \"-\" ]\ncat >/dev/null\nprintf '%s\\n' '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"[]\"}}'\n",
+        "#!/usr/bin/env bash\nset -euo pipefail\n[ \"$1\" = \"exec\" ]\n[ \"$2\" = \"--json\" ]\n[ \"$3\" = \"-\" ]\nmkdir -p .anne-test\ncat >.anne-test/codex-stdin.bin\nprintf '%s\\n' '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"[]\"}}'\n",
     );
     script
 }
