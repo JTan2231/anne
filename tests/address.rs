@@ -1163,6 +1163,107 @@ fn address_records_empty_selection_when_review_has_no_comments() {
 }
 
 #[test]
+fn address_reserves_unique_bundle_ids_for_same_second_runs() {
+    let repo = TestRepo::new("bundle-id-collision");
+    init_repo(repo.path());
+    write_init_template(repo.path());
+
+    let agent = agent_script(
+        repo.path(),
+        r#"cat >/dev/null
+cat <<'EOF'
+# Anne
+
+## Feature: Collision handling
+
+### Problem
+
+Multiple same-second address runs need separate bundles.
+
+### Goals
+
+- Keep each run isolated.
+
+### Non-Goals
+
+- Reusing an older address bundle.
+
+## Proposed Approach
+
+Reserve a unique bundle root before writing run artifacts.
+EOF
+"#,
+    );
+    write_agent_config(repo.path(), "text", &agent, None);
+
+    write_review_bundle(
+        repo.path(),
+        "2026-04-04T17-00-00Z-collision",
+        Some("2026-04-04T17:00:00Z"),
+        &[ReviewCommentSpec {
+            id: "R001",
+            path: "src/lib.rs",
+            side: "new",
+            line: 2,
+            severity: "warning",
+            title: "Collision title",
+            body: "Reserve a unique bundle.",
+            hunk_header: Some("@@ -1,1 +1,2 @@"),
+            patch_file: Some("files/0001-src-lib.rs.patch"),
+        }],
+    );
+
+    let bin_dir = repo.path().join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    fixed_date_script(&bin_dir, "2026-04-04T17:15:29Z");
+    let path_env = prepend_path(&bin_dir);
+
+    let first_output = anne_with_path(repo.path(), &["address", "R001"], Some(&path_env));
+    assert!(
+        first_output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&first_output.stdout),
+        String::from_utf8_lossy(&first_output.stderr)
+    );
+
+    let second_output = anne_with_path(repo.path(), &["address", "R001"], Some(&path_env));
+    assert!(
+        second_output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&second_output.stdout),
+        String::from_utf8_lossy(&second_output.stderr)
+    );
+
+    let base_id = address_bundle_id("2026-04-04T17:15:29Z", "R001");
+    let first_bundle = address_bundle_path(repo.path(), &first_output.stdout);
+    let second_bundle = address_bundle_path(repo.path(), &second_output.stdout);
+    let second_id = format!("{base_id}-2");
+
+    assert_eq!(
+        first_bundle,
+        repo.path().join(".anne/address").join(&base_id)
+    );
+    assert_eq!(
+        second_bundle,
+        repo.path().join(".anne/address").join(&second_id)
+    );
+    assert_ne!(first_bundle, second_bundle);
+
+    let first_manifest = fs::read_to_string(first_bundle.join("manifest.json")).unwrap();
+    assert!(first_manifest.contains(&format!("\"address_id\": \"{base_id}\"")));
+    assert!(first_manifest.contains(&format!("\"bundle_path\": \".anne/address/{base_id}\"")));
+    assert!(first_manifest.contains("\"selection_filter\": \"R001\""));
+
+    let second_manifest = fs::read_to_string(second_bundle.join("manifest.json")).unwrap();
+    assert!(second_manifest.contains(&format!("\"address_id\": \"{second_id}\"")));
+    assert!(second_manifest.contains(&format!("\"bundle_path\": \".anne/address/{second_id}\"")));
+    assert!(second_manifest.contains("\"selection_filter\": \"R001\""));
+
+    assert!(first_bundle.join("specs/R001-Collision-title.md").exists());
+    assert!(second_bundle.join("specs/R001-Collision-title.md").exists());
+}
+
+#[test]
 fn address_does_not_duplicate_existing_source_comment_section() {
     let repo = TestRepo::new("existing-source-comment");
     init_repo(repo.path());
@@ -1375,6 +1476,44 @@ fn agent_script(path: &Path, body: &str) -> PathBuf {
     script
 }
 
+fn fixed_date_script(path: &Path, timestamp: &str) -> PathBuf {
+    let script = path.join("date");
+    write_executable(
+        &script,
+        &format!("#!/bin/sh\nset -eu\nprintf '%s\\n' '{}'\n", timestamp),
+    );
+    script
+}
+
+fn address_bundle_id(timestamp: &str, selection_filter: &str) -> String {
+    format!(
+        "{}-latest-{}",
+        timestamp.replace(':', "-"),
+        slugify_for_address_id(selection_filter),
+    )
+}
+
+fn slugify_for_address_id(text: &str) -> String {
+    let mut output = String::new();
+    let mut last_dash = false;
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '.' {
+            output.push(ch);
+            last_dash = false;
+        } else if !last_dash {
+            output.push('-');
+            last_dash = true;
+        }
+    }
+
+    let output = output.trim_matches('-').to_string();
+    if output.is_empty() {
+        "file".to_string()
+    } else {
+        output
+    }
+}
+
 fn markdown_filter_script(path: &Path) -> PathBuf {
     let script = path.join("markdown-filter.sh");
     write_executable(
@@ -1385,11 +1524,25 @@ fn markdown_filter_script(path: &Path) -> PathBuf {
 }
 
 fn anne(path: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_anne"))
-        .args(args)
-        .current_dir(path)
-        .output()
-        .unwrap()
+    anne_with_path(path, args, None)
+}
+
+fn anne_with_path(path: &Path, args: &[&str], path_env: Option<&str>) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_anne"));
+    command.args(args).current_dir(path);
+    if let Some(path_env) = path_env {
+        command.env("PATH", path_env);
+    }
+    command.output().unwrap()
+}
+
+fn prepend_path(dir: &Path) -> String {
+    let current = std::env::var("PATH").unwrap_or_default();
+    if current.is_empty() {
+        dir.display().to_string()
+    } else {
+        format!("{}:{}", dir.display(), current)
+    }
 }
 
 fn address_bundle_path(repo: &Path, stdout: &[u8]) -> PathBuf {

@@ -2,6 +2,7 @@ use std::{
     cell::RefCell,
     collections::{BTreeMap, BTreeSet},
     env, fs,
+    io::ErrorKind,
     path::{Path, PathBuf},
 };
 
@@ -23,6 +24,28 @@ pub struct RunResult {
 }
 
 pub fn run(comment_id: Option<String>) -> Result<RunResult, String> {
+    let prepared = prepare_run(comment_id)?;
+    Ok(run_reserved(prepared))
+}
+
+struct PreparedRun {
+    repo_root: PathBuf,
+    config: AppConfig,
+    review_context: ReviewContext,
+    selected_comments: Vec<SourceComment>,
+    init_structure: InitStructure,
+    generated_at: String,
+    selection_filter: String,
+    bundle: ReservedAddressBundle,
+}
+
+struct ReservedAddressBundle {
+    address_id: String,
+    relative_bundle_path: PathBuf,
+    bundle_root: PathBuf,
+}
+
+fn prepare_run(comment_id: Option<String>) -> Result<PreparedRun, String> {
     let cwd = env::current_dir().map_err(|error| format!("failed to read current dir: {error}"))?;
     let repo_root = git::repo_root(&cwd)?;
     let config = AppConfig::load(&repo_root)?;
@@ -61,25 +84,36 @@ pub fn run(comment_id: Option<String>) -> Result<RunResult, String> {
     }
 
     let generated_at = current_timestamp();
-    let address_id = build_address_id(&generated_at, &selection_filter);
-    let relative_bundle_path = PathBuf::from(".anne").join("address").join(&address_id);
-    let bundle_root = repo_root.join(&relative_bundle_path);
-    fs::create_dir_all(bundle_root.join("specs"))
-        .map_err(|error| format!("failed creating address specs dir: {error}"))?;
-    fs::create_dir_all(bundle_root.join("agent"))
-        .map_err(|error| format!("failed creating address agent dir: {error}"))?;
+    let bundle = reserve_address_bundle(&repo_root, &generated_at, &selection_filter)?;
 
-    fs::write(
-        bundle_root.join("selected_comments.json"),
-        JsonValue::Array(
-            selected_comments
-                .iter()
-                .map(|comment| comment.raw_json.clone())
-                .collect(),
-        )
-        .render_pretty(),
-    )
-    .map_err(|error| format!("failed writing selected_comments.json: {error}"))?;
+    Ok(PreparedRun {
+        repo_root,
+        config,
+        review_context,
+        selected_comments,
+        init_structure,
+        generated_at,
+        selection_filter,
+        bundle,
+    })
+}
+
+fn run_reserved(prepared: PreparedRun) -> RunResult {
+    let PreparedRun {
+        repo_root,
+        config,
+        review_context,
+        selected_comments,
+        init_structure,
+        generated_at,
+        selection_filter,
+        bundle,
+    } = prepared;
+    let ReservedAddressBundle {
+        address_id,
+        relative_bundle_path,
+        bundle_root,
+    } = bundle;
 
     let mut manifest = Manifest {
         address_id,
@@ -107,7 +141,37 @@ pub fn run(comment_id: Option<String>) -> Result<RunResult, String> {
         errors: Vec::new(),
     };
     update_counts(&mut manifest);
-    write_outputs(&bundle_root, &manifest)?;
+
+    if let Err(error) = fs::create_dir_all(bundle_root.join("specs"))
+        .map_err(|error| format!("failed creating address specs dir: {error}"))
+    {
+        return persist_failed_manifest(&bundle_root, &mut manifest, error);
+    }
+
+    if let Err(error) = fs::create_dir_all(bundle_root.join("agent"))
+        .map_err(|error| format!("failed creating address agent dir: {error}"))
+    {
+        return persist_failed_manifest(&bundle_root, &mut manifest, error);
+    }
+
+    if let Err(error) = fs::write(
+        bundle_root.join("selected_comments.json"),
+        JsonValue::Array(
+            selected_comments
+                .iter()
+                .map(|comment| comment.raw_json.clone())
+                .collect(),
+        )
+        .render_pretty(),
+    )
+    .map_err(|error| format!("failed writing selected_comments.json: {error}"))
+    {
+        return persist_failed_manifest(&bundle_root, &mut manifest, error);
+    }
+
+    if let Err(result) = persist_outputs(&bundle_root, &mut manifest) {
+        return result;
+    }
 
     let manifest = RefCell::new(manifest);
     let queued_jobs = selected_comments
@@ -119,7 +183,7 @@ pub fn run(comment_id: Option<String>) -> Result<RunResult, String> {
         })
         .collect::<Vec<_>>();
 
-    agent::run_bounded(
+    let run_jobs = agent::run_bounded(
         config.agent.workers,
         queued_jobs,
         |_, job| {
@@ -130,7 +194,11 @@ pub fn run(comment_id: Option<String>) -> Result<RunResult, String> {
             run.agent_response_file = Some(format!("agent/{}.response.txt", job.comment.id));
             manifest.status = ManifestStatus::Running;
             update_counts(&mut manifest);
-            write_outputs(&bundle_root, &manifest)
+            persist_outputs(&bundle_root, &mut manifest).map_err(|result| {
+                result
+                    .error
+                    .unwrap_or_else(|| "failed persisting address outputs".to_string())
+            })
         },
         |_, job| {
             process_comment(
@@ -158,9 +226,17 @@ pub fn run(comment_id: Option<String>) -> Result<RunResult, String> {
 
             manifest.status = ManifestStatus::Running;
             update_counts(&mut manifest);
-            write_outputs(&bundle_root, &manifest)
+            persist_outputs(&bundle_root, &mut manifest).map_err(|result| {
+                result
+                    .error
+                    .unwrap_or_else(|| "failed persisting address outputs".to_string())
+            })
         },
-    )?;
+    );
+    if let Err(error) = run_jobs {
+        let mut manifest = manifest.into_inner();
+        return persist_failed_manifest(&bundle_root, &mut manifest, error);
+    }
 
     let mut manifest = manifest.into_inner();
 
@@ -171,10 +247,12 @@ pub fn run(comment_id: Option<String>) -> Result<RunResult, String> {
             ManifestStatus::Failed
         };
         update_counts(&mut manifest);
-        write_outputs(&bundle_root, &manifest)?;
+        if let Err(result) = persist_outputs(&bundle_root, &mut manifest) {
+            return result;
+        }
     }
 
-    Ok(to_run_result(&manifest))
+    to_run_result(&manifest, manifest.errors.first().cloned())
 }
 
 fn discover_review_context(repo_root: &Path) -> Result<ReviewContext, String> {
@@ -587,6 +665,40 @@ fn build_address_id(timestamp: &str, selection_filter: &str) -> String {
     )
 }
 
+fn reserve_address_bundle(
+    repo_root: &Path,
+    timestamp: &str,
+    selection_filter: &str,
+) -> Result<ReservedAddressBundle, String> {
+    let address_root = repo_root.join(".anne").join("address");
+    fs::create_dir_all(&address_root)
+        .map_err(|error| format!("failed creating address storage root: {error}"))?;
+
+    let base_address_id = build_address_id(timestamp, selection_filter);
+    for collision_index in 1usize.. {
+        let address_id = if collision_index == 1 {
+            base_address_id.clone()
+        } else {
+            format!("{base_address_id}-{collision_index}")
+        };
+        let relative_bundle_path = PathBuf::from(".anne").join("address").join(&address_id);
+        let bundle_root = repo_root.join(&relative_bundle_path);
+        match fs::create_dir(&bundle_root) {
+            Ok(()) => {
+                return Ok(ReservedAddressBundle {
+                    address_id,
+                    relative_bundle_path,
+                    bundle_root,
+                });
+            }
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("failed reserving address bundle: {error}")),
+        }
+    }
+
+    unreachable!("address bundle reservation must eventually return or error")
+}
+
 fn build_spec_file(comment: &SourceComment) -> String {
     let mut slug = slugify_text(&comment.title);
     if slug.len() > 48 {
@@ -608,6 +720,25 @@ fn write_outputs(bundle_root: &Path, manifest: &Manifest) -> Result<(), String> 
     fs::write(bundle_root.join("summary.md"), render_summary(manifest))
         .map_err(|error| format!("failed writing summary.md: {error}"))?;
     Ok(())
+}
+
+fn persist_outputs(bundle_root: &Path, manifest: &mut Manifest) -> Result<(), RunResult> {
+    write_outputs(bundle_root, manifest)
+        .map_err(|error| persist_failed_manifest(bundle_root, manifest, error))
+}
+
+fn persist_failed_manifest(
+    bundle_root: &Path,
+    manifest: &mut Manifest,
+    error: String,
+) -> RunResult {
+    mark_manifest_failed(manifest, &error);
+    let error = match write_outputs(bundle_root, manifest) {
+        Ok(()) => error,
+        Err(write_error) if write_error == error => error,
+        Err(write_error) => format!("{error}; {write_error}"),
+    };
+    to_run_result(manifest, Some(error))
 }
 
 fn render_summary(manifest: &Manifest) -> String {
@@ -706,14 +837,22 @@ fn update_counts(manifest: &mut Manifest) {
     };
 }
 
-fn to_run_result(manifest: &Manifest) -> RunResult {
+fn mark_manifest_failed(manifest: &mut Manifest, error: &str) {
+    manifest.status = ManifestStatus::Failed;
+    if manifest.errors.iter().all(|existing| existing != error) {
+        manifest.errors.push(error.to_string());
+    }
+    update_counts(manifest);
+}
+
+fn to_run_result(manifest: &Manifest, error: Option<String>) -> RunResult {
     RunResult {
         bundle_path: Some(manifest.bundle_path.clone()),
         comments_selected: manifest.counts.comments_selected,
         specs_generated: manifest.counts.specs_generated,
         specs_failed: manifest.counts.specs_failed,
         success: manifest.status == ManifestStatus::Succeeded,
-        error: manifest.errors.first().cloned(),
+        error,
     }
 }
 
@@ -1316,8 +1455,15 @@ impl CommentRun {
 
 #[cfg(test)]
 mod tests {
-    use super::{InitStructure, ReviewCandidate, ReviewManifest, sort_review_candidates};
-    use std::path::PathBuf;
+    use super::{
+        InitStructure, ReviewCandidate, ReviewManifest, build_address_id, reserve_address_bundle,
+        sort_review_candidates,
+    };
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     #[test]
     fn derives_feature_shape_from_init() {
@@ -1379,5 +1525,87 @@ mod tests {
             candidates.last().unwrap().review_id,
             "2026-04-04T01-00-00Z-b"
         );
+    }
+
+    #[test]
+    fn reserve_address_bundle_uses_base_id_when_available() {
+        let repo = TestDir::new("reserve-base");
+        let reserved = reserve_address_bundle(repo.path(), "2026-04-04T17:15:29Z", "all")
+            .expect("bundle reservation should succeed");
+
+        assert_eq!(
+            reserved.address_id,
+            build_address_id("2026-04-04T17:15:29Z", "all")
+        );
+        assert_eq!(
+            reserved.relative_bundle_path,
+            PathBuf::from(".anne")
+                .join("address")
+                .join(&reserved.address_id)
+        );
+        assert!(reserved.bundle_root.is_dir());
+    }
+
+    #[test]
+    fn reserve_address_bundle_retries_with_suffix_when_base_exists() {
+        let repo = TestDir::new("reserve-suffix-2");
+        let base_id = build_address_id("2026-04-04T17:15:29Z", "R014");
+        create_existing_address_bundle(repo.path(), &base_id);
+
+        let reserved = reserve_address_bundle(repo.path(), "2026-04-04T17:15:29Z", "R014")
+            .expect("bundle reservation should succeed");
+
+        assert_eq!(reserved.address_id, format!("{base_id}-2"));
+        assert!(reserved.bundle_root.is_dir());
+    }
+
+    #[test]
+    fn reserve_address_bundle_retries_past_multiple_existing_suffixes() {
+        let repo = TestDir::new("reserve-suffix-4");
+        let base_id = build_address_id("2026-04-04T17:15:29Z", "R014");
+        create_existing_address_bundle(repo.path(), &base_id);
+        create_existing_address_bundle(repo.path(), &format!("{base_id}-2"));
+        create_existing_address_bundle(repo.path(), &format!("{base_id}-3"));
+
+        let reserved = reserve_address_bundle(repo.path(), "2026-04-04T17:15:29Z", "R014")
+            .expect("bundle reservation should succeed");
+
+        assert_eq!(reserved.address_id, format!("{base_id}-4"));
+        assert!(reserved.bundle_root.is_dir());
+    }
+
+    fn create_existing_address_bundle(repo_root: &Path, address_id: &str) {
+        fs::create_dir_all(repo_root.join(".anne").join("address").join(address_id)).unwrap();
+    }
+
+    struct TestDir {
+        path: PathBuf,
+    }
+
+    impl TestDir {
+        fn new(label: &str) -> Self {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "anne-address-unit-test-{}-{}-{}",
+                label,
+                std::process::id(),
+                unique
+            ));
+            fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
     }
 }
