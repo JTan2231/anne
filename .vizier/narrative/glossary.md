@@ -1,6 +1,7 @@
 # Glossary
 
 - Review bundle: The on-disk artifact directory for one `anne review` run at `.anne/reviews/<review-id>/`. Successful and post-preflight-failure runs include the reviewed diff, manifest, rendered comments, structured findings, per-file patches, and raw agent I/O; preflight failure bundles are smaller and guarantee only `manifest.json`, `comments.md`, and `comments.json = []`.
+- Usable review bundle: For `anne address`, a review bundle whose `comments.json` exists, is readable, and parses into Anne’s current source-comment schema. Address scans candidates newest-first by `generated_at` and then `review_id`, skips unusable bundles, and does not treat `manifest.status` alone as a selection gate.
 - Review materialization boundary: The point after repository discovery and config loading where Anne allocates `<review-id>`, creates `.anne/reviews/<review-id>/`, writes an initial manifest with `stage = preflight`, and begins repository-open/ref/merge-base/diff preflight inside that durable bundle.
 - Review stage: The manifest field that marks the furthest persisted review phase Anne reached. `preflight` covers repository-open/ref/merge-base/diff setup, `file_review` covers per-file enumeration and agent execution, and `rendered` means the final review outputs were written.
 - Preflight progress: The machine-readable manifest object that records whether Anne opened the repository and resolved the base ref, head ref, merge base, and full diff before the run terminated or advanced into file review.

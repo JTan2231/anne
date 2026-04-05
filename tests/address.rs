@@ -256,6 +256,341 @@ EOF
 }
 
 #[test]
+fn address_falls_back_when_newest_review_bundle_is_missing_comments_json() {
+    let repo = TestRepo::new("missing-comments-fallback");
+    init_repo(repo.path());
+    write_init_template(repo.path());
+
+    let agent = agent_script(
+        repo.path(),
+        r#"cat >/dev/null
+cat <<'EOF'
+# Anne
+
+## Feature: Missing comments fallback
+
+### Problem
+
+Address should skip incomplete newer review bundles.
+
+### Goals
+
+- Use the newest usable review bundle.
+
+### Non-Goals
+
+- Failing on the first incomplete candidate.
+
+## Proposed Approach
+
+Use the fallback review bundle when comments.json is unavailable.
+EOF
+"#,
+    );
+    write_agent_config(repo.path(), "text", &agent, None);
+
+    write_review_bundle(
+        repo.path(),
+        "2026-04-04T10-00-00Z-older-complete",
+        Some("2026-04-04T10:00:00Z"),
+        &[ReviewCommentSpec {
+            id: "R001",
+            path: "src/fallback.rs",
+            side: "new",
+            line: 2,
+            severity: "warning",
+            title: "Fallback title",
+            body: "Use the older bundle.",
+            hunk_header: Some("@@ -1,1 +1,2 @@"),
+            patch_file: Some("files/0001-src-fallback.rs.patch"),
+        }],
+    );
+    write_review_bundle(
+        repo.path(),
+        "2026-04-04T11-00-00Z-newer-incomplete",
+        Some("2026-04-04T11:00:00Z"),
+        &[ReviewCommentSpec {
+            id: "R001",
+            path: "src/newest.rs",
+            side: "new",
+            line: 8,
+            severity: "warning",
+            title: "Newest title",
+            body: "This bundle should be skipped.",
+            hunk_header: Some("@@ -7,1 +7,2 @@"),
+            patch_file: Some("files/0001-src-newest.rs.patch"),
+        }],
+    );
+    fs::remove_file(
+        review_bundle_path(repo.path(), "2026-04-04T11-00-00Z-newer-incomplete")
+            .join("comments.json"),
+    )
+    .unwrap();
+
+    let output = anne(repo.path(), &["address", "R001"]);
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let bundle = address_bundle_path(repo.path(), &output.stdout);
+    let manifest = fs::read_to_string(bundle.join("manifest.json")).unwrap();
+    assert!(manifest.contains("\"review_id\": \"2026-04-04T10-00-00Z-older-complete\""));
+
+    let selected_comments = fs::read_to_string(bundle.join("selected_comments.json")).unwrap();
+    assert!(selected_comments.contains("\"path\": \"src/fallback.rs\""));
+    assert!(!selected_comments.contains("\"path\": \"src/newest.rs\""));
+}
+
+#[test]
+fn address_falls_back_when_newest_review_bundle_has_invalid_comments_json() {
+    let repo = TestRepo::new("invalid-comments-fallback");
+    init_repo(repo.path());
+    write_init_template(repo.path());
+
+    let agent = agent_script(
+        repo.path(),
+        r#"cat >/dev/null
+cat <<'EOF'
+# Anne
+
+## Feature: Invalid comments fallback
+
+### Problem
+
+Address should skip malformed newer review bundles.
+
+### Goals
+
+- Use the newest parseable review bundle.
+
+### Non-Goals
+
+- Failing on malformed JSON in a newer candidate.
+
+## Proposed Approach
+
+Keep scanning until a usable comments snapshot is found.
+EOF
+"#,
+    );
+    write_agent_config(repo.path(), "text", &agent, None);
+
+    write_review_bundle(
+        repo.path(),
+        "2026-04-04T10-00-00Z-older-valid",
+        Some("2026-04-04T10:00:00Z"),
+        &[ReviewCommentSpec {
+            id: "R001",
+            path: "src/older.rs",
+            side: "new",
+            line: 2,
+            severity: "warning",
+            title: "Older valid title",
+            body: "Use the older valid bundle.",
+            hunk_header: Some("@@ -1,1 +1,2 @@"),
+            patch_file: Some("files/0001-src-older.rs.patch"),
+        }],
+    );
+    write_review_bundle(
+        repo.path(),
+        "2026-04-04T11-00-00Z-newer-invalid",
+        Some("2026-04-04T11:00:00Z"),
+        &[ReviewCommentSpec {
+            id: "R001",
+            path: "src/newer.rs",
+            side: "new",
+            line: 4,
+            severity: "warning",
+            title: "Newest invalid title",
+            body: "This bundle should be skipped.",
+            hunk_header: Some("@@ -3,1 +3,2 @@"),
+            patch_file: Some("files/0001-src-newer.rs.patch"),
+        }],
+    );
+    write_file(
+        &review_bundle_path(repo.path(), "2026-04-04T11-00-00Z-newer-invalid")
+            .join("comments.json"),
+        "{\n",
+    );
+
+    let output = anne(repo.path(), &["address"]);
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let bundle = address_bundle_path(repo.path(), &output.stdout);
+    let manifest = fs::read_to_string(bundle.join("manifest.json")).unwrap();
+    assert!(manifest.contains("\"review_id\": \"2026-04-04T10-00-00Z-older-valid\""));
+
+    let selected_comments = fs::read_to_string(bundle.join("selected_comments.json")).unwrap();
+    assert!(selected_comments.contains("\"path\": \"src/older.rs\""));
+    assert!(!selected_comments.contains("\"path\": \"src/newer.rs\""));
+}
+
+#[test]
+fn address_selects_review_bundle_with_failed_manifest_status_when_comments_are_valid() {
+    let repo = TestRepo::new("failed-status-still-usable");
+    init_repo(repo.path());
+    write_init_template(repo.path());
+
+    let agent = agent_script(
+        repo.path(),
+        r#"cat >/dev/null
+cat <<'EOF'
+# Anne
+
+## Feature: Failed status still usable
+
+### Problem
+
+Address should not require review success status to reuse comments.
+
+### Goals
+
+- Keep parseable comments eligible.
+
+### Non-Goals
+
+- Treating manifest status as a hard gate.
+
+## Proposed Approach
+
+Select the bundle when comments.json remains valid.
+EOF
+"#,
+    );
+    write_agent_config(repo.path(), "text", &agent, None);
+
+    let review_id = "2026-04-04T12-00-00Z-failed-status";
+    write_review_bundle(
+        repo.path(),
+        review_id,
+        Some("2026-04-04T12:00:00Z"),
+        &[ReviewCommentSpec {
+            id: "R001",
+            path: "src/failed.rs",
+            side: "new",
+            line: 2,
+            severity: "warning",
+            title: "Failed status title",
+            body: "This bundle should still be selected.",
+            hunk_header: Some("@@ -1,1 +1,2 @@"),
+            patch_file: Some("files/0001-src-failed.rs.patch"),
+        }],
+    );
+
+    let manifest_path = review_bundle_path(repo.path(), review_id).join("manifest.json");
+    let manifest = fs::read_to_string(&manifest_path).unwrap();
+    write_file(
+        &manifest_path,
+        &manifest.replace("\"status\": \"succeeded\"", "\"status\": \"failed\""),
+    );
+
+    let output = anne(repo.path(), &["address"]);
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let bundle = address_bundle_path(repo.path(), &output.stdout);
+    let manifest = fs::read_to_string(bundle.join("manifest.json")).unwrap();
+    assert!(manifest.contains(&format!("\"review_id\": \"{review_id}\"")));
+    assert!(manifest.contains("\"status\": \"failed\""));
+}
+
+#[test]
+fn address_fails_when_review_bundles_exist_but_none_are_usable() {
+    let repo = TestRepo::new("no-usable-review-bundle");
+    init_repo(repo.path());
+    write_init_template(repo.path());
+
+    write_review_bundle(
+        repo.path(),
+        "2026-04-04T10-00-00Z-older-invalid",
+        Some("2026-04-04T10:00:00Z"),
+        &[ReviewCommentSpec {
+            id: "R001",
+            path: "src/older.rs",
+            side: "new",
+            line: 2,
+            severity: "warning",
+            title: "Older title",
+            body: "Older body.",
+            hunk_header: Some("@@ -1,1 +1,2 @@"),
+            patch_file: Some("files/0001-src-older.rs.patch"),
+        }],
+    );
+    write_file(
+        &review_bundle_path(repo.path(), "2026-04-04T10-00-00Z-older-invalid")
+            .join("comments.json"),
+        "{\n",
+    );
+
+    write_review_bundle(
+        repo.path(),
+        "2026-04-04T11-00-00Z-newer-missing",
+        Some("2026-04-04T11:00:00Z"),
+        &[ReviewCommentSpec {
+            id: "R001",
+            path: "src/newer.rs",
+            side: "new",
+            line: 2,
+            severity: "warning",
+            title: "Newest title",
+            body: "Newest body.",
+            hunk_header: Some("@@ -1,1 +1,2 @@"),
+            patch_file: Some("files/0001-src-newer.rs.patch"),
+        }],
+    );
+    fs::remove_file(
+        review_bundle_path(repo.path(), "2026-04-04T11-00-00Z-newer-missing").join("comments.json"),
+    )
+    .unwrap();
+
+    let output = anne(repo.path(), &["address"]);
+    assert!(
+        !output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("no usable review bundle was found"));
+    assert!(stderr.contains("2026-04-04T11-00-00Z-newer-missing"));
+    assert!(stderr.contains("comments.json was not readable"));
+    assert!(stderr.contains("2026-04-04T10-00-00Z-older-invalid"));
+    assert!(stderr.contains("comments.json was not valid"));
+    assert!(!repo.path().join(".anne/address").exists());
+}
+
+#[test]
+fn address_reports_missing_review_outputs_before_bundle_creation() {
+    let repo = TestRepo::new("no-review-outputs");
+    init_repo(repo.path());
+
+    let output = anne(repo.path(), &["address"]);
+    assert!(
+        !output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("no review outputs discovered under `.anne/reviews/`"));
+    assert!(!repo.path().join(".anne/address").exists());
+}
+
+#[test]
 fn address_preserves_partial_results_when_one_comment_fails() {
     let repo = TestRepo::new("partial-failure");
     init_repo(repo.path());
@@ -1064,6 +1399,10 @@ fn address_bundle_path(repo: &Path, stdout: &[u8]) -> PathBuf {
         .find_map(|line| line.strip_prefix("Address bundle: "))
         .expect("missing bundle path in stdout");
     repo.join(bundle)
+}
+
+fn review_bundle_path(repo: &Path, review_id: &str) -> PathBuf {
+    repo.join(".anne/reviews").join(review_id)
 }
 
 fn write_file(path: &Path, contents: &str) {

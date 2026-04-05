@@ -182,7 +182,7 @@ fn discover_review_context(repo_root: &Path) -> Result<ReviewContext, String> {
     let entries = match fs::read_dir(&reviews_root) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err("no review outputs discovered under `.anne/reviews/`".to_string());
+            return Err(no_review_outputs_error());
         }
         Err(error) => {
             return Err(format!(
@@ -214,60 +214,23 @@ fn discover_review_context(repo_root: &Path) -> Result<ReviewContext, String> {
     }
 
     if candidates.is_empty() {
-        return Err("no review outputs discovered under `.anne/reviews/`".to_string());
+        return Err(no_review_outputs_error());
     }
 
-    candidates.sort_by(|left, right| {
-        left.generated_at()
-            .cmp(&right.generated_at())
-            .then(left.review_id.cmp(&right.review_id))
-    });
+    sort_review_candidates(&mut candidates);
 
-    let selected = candidates
-        .pop()
-        .ok_or_else(|| "no review outputs discovered under `.anne/reviews/`".to_string())?;
+    let mut skipped = Vec::new();
+    for candidate in candidates.into_iter().rev() {
+        match load_review_context(&candidate) {
+            Ok(context) => return Ok(context),
+            Err(reason) => skipped.push(SkippedReviewCandidate {
+                review_id: candidate.review_id,
+                reason,
+            }),
+        }
+    }
 
-    let comments_path = selected.bundle_root.join("comments.json");
-    let comments_text = fs::read_to_string(&comments_path).map_err(|error| {
-        format!(
-            "selected review `{}` is missing a readable comments.json: {error}",
-            selected.review_id
-        )
-    })?;
-    let comments = parse_comments(&comments_text).map_err(|error| {
-        format!(
-            "failed parsing comments.json for review `{}`: {error}",
-            selected.review_id
-        )
-    })?;
-
-    Ok(ReviewContext {
-        review_id: selected.review_id.clone(),
-        bundle_path: PathBuf::from(".anne")
-            .join("reviews")
-            .join(&selected.review_id)
-            .display()
-            .to_string(),
-        bundle_root: selected.bundle_root.clone(),
-        generated_at: selected.generated_at().cloned(),
-        range: selected
-            .manifest
-            .as_ref()
-            .and_then(|manifest| manifest.range.clone()),
-        merge_base: selected
-            .manifest
-            .as_ref()
-            .and_then(|manifest| manifest.merge_base.clone()),
-        status: selected
-            .manifest
-            .as_ref()
-            .and_then(|manifest| manifest.status.clone()),
-        diff_patch: selected
-            .manifest
-            .as_ref()
-            .and_then(|manifest| manifest.diff_patch.clone()),
-        comments,
-    })
+    Err(no_usable_review_bundle_error(&skipped))
 }
 
 fn read_review_manifest(bundle_root: &Path) -> Option<ReviewManifest> {
@@ -312,6 +275,46 @@ fn parse_comments(text: &str) -> Result<Vec<SourceComment>, String> {
     }
 
     Ok(comments)
+}
+
+fn no_review_outputs_error() -> String {
+    "no review outputs discovered under `.anne/reviews/`".to_string()
+}
+
+fn no_usable_review_bundle_error(skipped: &[SkippedReviewCandidate]) -> String {
+    let mut error =
+        "review bundles were found under `.anne/reviews/`, but no usable review bundle was found"
+            .to_string();
+    if skipped.is_empty() {
+        return error;
+    }
+
+    error.push_str(": ");
+    for (index, candidate) in skipped.iter().enumerate() {
+        if index > 0 {
+            error.push_str("; ");
+        }
+        error.push_str(&format!("`{}` ({})", candidate.review_id, candidate.reason));
+    }
+
+    error
+}
+
+fn sort_review_candidates(candidates: &mut [ReviewCandidate]) {
+    candidates.sort_by(|left, right| {
+        left.generated_at()
+            .cmp(&right.generated_at())
+            .then(left.review_id.cmp(&right.review_id))
+    });
+}
+
+fn load_review_context(candidate: &ReviewCandidate) -> Result<ReviewContext, String> {
+    let comments_path = candidate.bundle_root.join("comments.json");
+    let comments_text = fs::read_to_string(&comments_path)
+        .map_err(|error| format!("comments.json was not readable: {error}"))?;
+    let comments = parse_comments(&comments_text)
+        .map_err(|error| format!("comments.json was not valid: {error}"))?;
+    Ok(candidate.review_context(comments))
 }
 
 fn process_comment(
@@ -832,6 +835,42 @@ impl ReviewCandidate {
             .as_ref()
             .and_then(|manifest| manifest.generated_at.as_ref())
     }
+
+    fn review_context(&self, comments: Vec<SourceComment>) -> ReviewContext {
+        ReviewContext {
+            review_id: self.review_id.clone(),
+            bundle_path: PathBuf::from(".anne")
+                .join("reviews")
+                .join(&self.review_id)
+                .display()
+                .to_string(),
+            bundle_root: self.bundle_root.clone(),
+            generated_at: self.generated_at().cloned(),
+            range: self
+                .manifest
+                .as_ref()
+                .and_then(|manifest| manifest.range.clone()),
+            merge_base: self
+                .manifest
+                .as_ref()
+                .and_then(|manifest| manifest.merge_base.clone()),
+            status: self
+                .manifest
+                .as_ref()
+                .and_then(|manifest| manifest.status.clone()),
+            diff_patch: self
+                .manifest
+                .as_ref()
+                .and_then(|manifest| manifest.diff_patch.clone()),
+            comments,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SkippedReviewCandidate {
+    review_id: String,
+    reason: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1277,7 +1316,7 @@ impl CommentRun {
 
 #[cfg(test)]
 mod tests {
-    use super::{InitStructure, ReviewCandidate, ReviewManifest};
+    use super::{InitStructure, ReviewCandidate, ReviewManifest, sort_review_candidates};
     use std::path::PathBuf;
 
     #[test]
@@ -1334,11 +1373,7 @@ mod tests {
             },
         ];
 
-        candidates.sort_by(|left, right| {
-            left.generated_at()
-                .cmp(&right.generated_at())
-                .then(left.review_id.cmp(&right.review_id))
-        });
+        sort_review_candidates(&mut candidates);
 
         assert_eq!(
             candidates.last().unwrap().review_id,

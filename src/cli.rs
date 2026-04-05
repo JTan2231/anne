@@ -161,7 +161,7 @@ fn address_help() -> String {
     "\
 anne address
 
-Generate one feature spec per selected review comment from the latest persisted review bundle.
+Generate one feature spec per selected review comment from the newest usable persisted review bundle.
 
 Usage:
   anne address
@@ -169,7 +169,7 @@ Usage:
 
 Notes:
   - Anne discovers review bundles at runtime under `.anne/reviews/`.
-  - Without a comment id, Anne addresses all comments from the newest review bundle in stable id order.
-  - With a comment id, Anne addresses exactly that comment from the newest review bundle."
+  - Without a comment id, Anne addresses all comments from the newest usable review bundle in stable id order.
+  - With a comment id, Anne addresses exactly that comment from the newest usable review bundle."
         .to_string()
 }

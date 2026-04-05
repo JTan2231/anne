@@ -1,0 +1,16 @@
+{
+  "plan_id": "pln_ac02406a538b4d499abe967ae10be782",
+  "slug": "r013-newest-incomplete-review-bu",
+  "branch": "draft/r013-newest-incomplete-review-bu",
+  "source": "inline",
+  "intent": null,
+  "target_branch": null,
+  "work_ref": "workflow-job:wf-run_25236c7b59354be99763dfd29c2f4872-develop_draft__persist_plan",
+  "status": "proposed",
+  "summary": "Anne currently selects the single newest persisted review bundle before proving that the bundle is usable, as reflect...",
+  "created_at": "2026-04-05T05:09:33.438670044+00:00",
+  "updated_at": "2026-04-05T05:09:33.438670044+00:00",
+  "job_ids": {
+    "persist": "wf-run_25236c7b59354be99763dfd29c2f4872-develop_draft__persist_plan"
+  }
+}
