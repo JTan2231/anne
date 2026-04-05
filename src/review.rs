@@ -65,14 +65,14 @@ fn run_materialized(request: ReviewRequest, prepared: PreparedRun) -> RunResult 
     }
 
     let mut manifest = build_manifest(&request, &config, review_id, generated_at, bundle_path);
-    if let Err(result) = persist_running_manifest(&bundle_root, &mut manifest) {
+    if let Err(result) = persist_running_snapshot(&bundle_root, &mut manifest) {
         return result;
     }
 
     let repo = match git::open_repo(&repo_root) {
         Ok(repo) => {
             manifest.preflight.repository_opened = true;
-            if let Err(result) = persist_running_manifest(&bundle_root, &mut manifest) {
+            if let Err(result) = persist_running_snapshot(&bundle_root, &mut manifest) {
                 return result;
             }
             repo
@@ -83,7 +83,7 @@ fn run_materialized(request: ReviewRequest, prepared: PreparedRun) -> RunResult 
     let base_oid = match git::resolve_commit_oid(&repo, &request.base, "base") {
         Ok(base_oid) => {
             manifest.preflight.base_resolved = true;
-            if let Err(result) = persist_running_manifest(&bundle_root, &mut manifest) {
+            if let Err(result) = persist_running_snapshot(&bundle_root, &mut manifest) {
                 return result;
             }
             base_oid
@@ -94,7 +94,7 @@ fn run_materialized(request: ReviewRequest, prepared: PreparedRun) -> RunResult 
     let head_oid = match git::resolve_commit_oid(&repo, &request.head, "head") {
         Ok(head_oid) => {
             manifest.preflight.head_resolved = true;
-            if let Err(result) = persist_running_manifest(&bundle_root, &mut manifest) {
+            if let Err(result) = persist_running_snapshot(&bundle_root, &mut manifest) {
                 return result;
             }
             head_oid
@@ -112,7 +112,7 @@ fn run_materialized(request: ReviewRequest, prepared: PreparedRun) -> RunResult 
         Ok(merge_base_oid) => {
             manifest.preflight.merge_base_resolved = true;
             manifest.merge_base = Some(merge_base_oid.to_string());
-            if let Err(result) = persist_running_manifest(&bundle_root, &mut manifest) {
+            if let Err(result) = persist_running_snapshot(&bundle_root, &mut manifest) {
                 return result;
             }
             merge_base_oid
@@ -123,7 +123,7 @@ fn run_materialized(request: ReviewRequest, prepared: PreparedRun) -> RunResult 
     let review_range = match git::build_review_range(&repo, merge_base_oid, head_oid) {
         Ok(review_range) => {
             manifest.preflight.diff_generated = true;
-            if let Err(result) = persist_running_manifest(&bundle_root, &mut manifest) {
+            if let Err(result) = persist_running_snapshot(&bundle_root, &mut manifest) {
                 return result;
             }
             review_range
@@ -137,7 +137,7 @@ fn run_materialized(request: ReviewRequest, prepared: PreparedRun) -> RunResult 
         return persist_preflight_failure(&bundle_root, &mut manifest, error);
     }
     manifest.diff_patch = Some("diff.patch".to_string());
-    if let Err(result) = persist_running_manifest(&bundle_root, &mut manifest) {
+    if let Err(result) = persist_running_snapshot(&bundle_root, &mut manifest) {
         return result;
     }
 
@@ -152,7 +152,7 @@ fn run_materialized(request: ReviewRequest, prepared: PreparedRun) -> RunResult 
     manifest.stage = ManifestStage::FileReview;
     sync_manifest_files(&mut manifest, &files);
     update_counts(&mut manifest);
-    if let Err(result) = persist_running_manifest(&bundle_root, &mut manifest) {
+    if let Err(result) = persist_running_snapshot(&bundle_root, &mut manifest) {
         return result;
     }
 
@@ -207,8 +207,9 @@ fn run_materialized(request: ReviewRequest, prepared: PreparedRun) -> RunResult 
         manifest.status = ManifestStatus::Failed;
         sync_manifest_files(&mut manifest, &files);
         update_counts(&mut manifest);
-        if let Err(write_error) = finalize_outputs(&bundle_root, &mut manifest, &[]) {
-            return persist_failed_manifest(&bundle_root, &mut manifest, write_error);
+        manifest.stage = ManifestStage::Rendered;
+        if let Err(write_error) = publish_review_snapshot(&bundle_root, &manifest, &[]) {
+            return failure_result_from_manifest(&mut manifest, write_error);
         }
         return to_run_result(&manifest, Some(error));
     }
@@ -242,7 +243,7 @@ fn run_materialized(request: ReviewRequest, prepared: PreparedRun) -> RunResult 
             sync_manifest_files(&mut manifest, &files);
             manifest.status = ManifestStatus::Running;
             update_counts(&mut manifest);
-            write_manifest(&bundle_root, &manifest)
+            publish_review_snapshot(&bundle_root, &manifest, &[])
         },
         |_, job| {
             review_file(
@@ -278,7 +279,7 @@ fn run_materialized(request: ReviewRequest, prepared: PreparedRun) -> RunResult 
             sync_manifest_files(&mut manifest, &files);
             manifest.status = ManifestStatus::Running;
             update_counts(&mut manifest);
-            write_manifest(&bundle_root, &manifest)
+            publish_review_snapshot(&bundle_root, &manifest, &[])
         },
     );
 
@@ -309,8 +310,9 @@ fn run_materialized(request: ReviewRequest, prepared: PreparedRun) -> RunResult 
         ManifestStatus::Failed
     };
     update_counts(&mut manifest);
-    if let Err(error) = finalize_outputs(&bundle_root, &mut manifest, &findings) {
-        return persist_failed_manifest(&bundle_root, &mut manifest, error);
+    manifest.stage = ManifestStage::Rendered;
+    if let Err(error) = publish_review_snapshot(&bundle_root, &manifest, &findings) {
+        return failure_result_from_manifest(&mut manifest, error);
     }
 
     to_run_result(&manifest, manifest.errors.first().cloned())
@@ -375,8 +377,8 @@ fn failure_result_from_manifest(manifest: &mut Manifest, error: String) -> RunRe
     to_run_result(manifest, Some(error))
 }
 
-fn persist_running_manifest(bundle_root: &Path, manifest: &mut Manifest) -> Result<(), RunResult> {
-    write_manifest(bundle_root, manifest)
+fn persist_running_snapshot(bundle_root: &Path, manifest: &mut Manifest) -> Result<(), RunResult> {
+    publish_review_snapshot(bundle_root, manifest, &[])
         .map_err(|error| failure_result_from_manifest(manifest, error))
 }
 
@@ -386,7 +388,7 @@ fn persist_preflight_failure(
     error: String,
 ) -> RunResult {
     mark_manifest_failed(manifest, &error);
-    let error = match write_outputs(bundle_root, manifest, &[]) {
+    let error = match publish_review_snapshot(bundle_root, manifest, &[]) {
         Ok(()) => error,
         Err(write_error) if write_error == error => error,
         Err(write_error) => format!("{error}; {write_error}"),
@@ -400,7 +402,10 @@ fn persist_failed_manifest(
     error: String,
 ) -> RunResult {
     mark_manifest_failed(manifest, &error);
-    let error = match write_manifest(bundle_root, manifest) {
+    if manifest.stage != ManifestStage::Preflight {
+        manifest.stage = ManifestStage::Rendered;
+    }
+    let error = match publish_review_snapshot(bundle_root, manifest, &[]) {
         Ok(()) => error,
         Err(write_error) if write_error == error => error,
         Err(write_error) => format!("{error}; {write_error}"),
@@ -838,15 +843,6 @@ fn write_manifest(bundle_root: &Path, manifest: &Manifest) -> Result<(), String>
     .map_err(|error| format!("failed writing manifest.json: {error}"))
 }
 
-fn write_outputs(
-    bundle_root: &Path,
-    manifest: &Manifest,
-    findings: &[Finding],
-) -> Result<(), String> {
-    write_manifest(bundle_root, manifest)?;
-    write_comments_outputs(bundle_root, manifest, findings)
-}
-
 fn write_comments_outputs(
     bundle_root: &Path,
     manifest: &Manifest,
@@ -865,28 +861,28 @@ fn write_comments_outputs(
     Ok(())
 }
 
-fn finalize_outputs(
+fn publish_review_snapshot(
     bundle_root: &Path,
-    manifest: &mut Manifest,
+    manifest: &Manifest,
     findings: &[Finding],
 ) -> Result<(), String> {
     write_comments_outputs(bundle_root, manifest, findings)?;
-    manifest.stage = ManifestStage::Rendered;
     write_manifest(bundle_root, manifest)
 }
 
 fn render_markdown(manifest: &Manifest, findings: &[Finding]) -> String {
-    if manifest.stage == ManifestStage::Preflight && manifest.status == ManifestStatus::Failed {
-        return render_preflight_failure_markdown(manifest);
+    if manifest.stage == ManifestStage::Preflight {
+        return render_preflight_markdown(manifest);
     }
 
     render_file_review_markdown(manifest, findings)
 }
 
-fn render_preflight_failure_markdown(manifest: &Manifest) -> String {
+fn render_preflight_markdown(manifest: &Manifest) -> String {
     let mut text = String::new();
     text.push_str(&format!("# Review: {}\n\n", manifest.range));
     text.push_str(&format!("- Generated: {}\n", manifest.generated_at));
+    text.push_str(&format!("- Status: {}\n", manifest.status.as_str()));
     text.push_str(&format!(
         "- Repository opened: {}\n",
         yes_no(manifest.preflight.repository_opened)
@@ -908,15 +904,26 @@ fn render_preflight_failure_markdown(manifest: &Manifest) -> String {
         yes_no(manifest.preflight.diff_generated)
     ));
 
-    if let Some(error) = manifest.errors.last() {
-        text.push_str("## Failure\n\n");
-        text.push_str(error);
-        text.push_str("\n\n");
+    match manifest.status {
+        ManifestStatus::Running => {
+            text.push_str(
+                "Review preflight is still running. `comments.json` remains `[]` until Anne reaches file analysis and can publish a usable review snapshot.\n",
+            );
+        }
+        ManifestStatus::Failed => {
+            if let Some(error) = manifest.errors.last() {
+                text.push_str("## Failure\n\n");
+                text.push_str(error);
+                text.push_str("\n\n");
+            }
+            text.push_str(
+                "No file review occurred. comments.json is empty because Anne never reached file analysis.\n",
+            );
+        }
+        ManifestStatus::Succeeded => {
+            text.push_str("Review preflight completed.\n");
+        }
     }
-
-    text.push_str(
-        "No file review occurred. comments.json is empty because Anne never reached file analysis.\n",
-    );
     text
 }
 
@@ -924,6 +931,7 @@ fn render_file_review_markdown(manifest: &Manifest, findings: &[Finding]) -> Str
     let mut text = String::new();
     text.push_str(&format!("# Review: {}\n\n", manifest.range));
     text.push_str(&format!("- Generated: {}\n", manifest.generated_at));
+    text.push_str(&format!("- Status: {}\n", manifest.status.as_str()));
     text.push_str(&format!(
         "- Merge base: {}\n",
         manifest.merge_base.as_deref().unwrap_or("unresolved")
@@ -942,11 +950,23 @@ fn render_file_review_markdown(manifest: &Manifest, findings: &[Finding]) -> Str
             manifest.counts.files_failed
         ));
     }
-    text.push_str(&format!("- Findings: {}\n", manifest.counts.findings));
+    if manifest.status == ManifestStatus::Running {
+        text.push_str(&format!(
+            "- Findings observed: {}\n",
+            manifest.counts.findings
+        ));
+    } else {
+        text.push_str(&format!("- Findings: {}\n", manifest.counts.findings));
+    }
     text.push_str(&format!(
         "- Patch: {}\n\n",
         manifest.diff_patch.as_deref().unwrap_or("unavailable")
     ));
+    if manifest.status == ManifestStatus::Running {
+        text.push_str(
+            "This review is still running. `comments.json` remains a readable placeholder until Anne publishes final stable finding ids.\n\n",
+        );
+    }
 
     let runtime_notes = manifest
         .files
@@ -978,6 +998,23 @@ fn render_file_review_markdown(manifest: &Manifest, findings: &[Finding]) -> Str
         text.push_str(&format!("## {}\n\n", file.path));
         match file.status {
             FileStatus::Reviewed => {
+                if manifest.status == ManifestStatus::Running {
+                    text.push_str(
+                        "Review complete for this file. Final findings publish when the full review finishes.\n\n",
+                    );
+                    if file.findings == 0 {
+                        text.push_str(
+                            "No unpublished findings were reported for this file so far.\n\n",
+                        );
+                    } else {
+                        text.push_str(&format!(
+                            "{} unpublished finding{} pending final publication.\n\n",
+                            file.findings,
+                            if file.findings == 1 { "" } else { "s" }
+                        ));
+                    }
+                    continue;
+                }
                 let file_findings = findings_by_path
                     .get(file.path.as_str())
                     .cloned()
@@ -1009,7 +1046,12 @@ fn render_file_review_markdown(manifest: &Manifest, findings: &[Finding]) -> Str
             FileStatus::Running => {
                 text.push_str("Review running.\n\n");
             }
-            FileStatus::Queued | FileStatus::Skipped => {}
+            FileStatus::Queued => {
+                if manifest.status == ManifestStatus::Running {
+                    text.push_str("Queued for review.\n\n");
+                }
+            }
+            FileStatus::Skipped => {}
         }
     }
 

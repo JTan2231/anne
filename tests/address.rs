@@ -256,6 +256,207 @@ EOF
 }
 
 #[test]
+fn address_prefers_newest_completed_review_over_newer_running_bundle() {
+    let repo = TestRepo::new("completed-over-running");
+    init_repo(repo.path());
+    write_init_template(repo.path());
+
+    let agent = agent_script(
+        repo.path(),
+        r#"cat >/dev/null
+cat <<'EOF'
+# Anne
+
+## Feature: Completed bundle preferred
+
+### Problem
+
+A newer running review should not displace the newest completed usable review.
+
+### Goals
+
+- Prefer the completed bundle when both are readable.
+
+### Non-Goals
+
+- Consuming in-flight running comments.
+
+## Proposed Approach
+
+Keep scanning completed bundles before falling back to running ones.
+EOF
+"#,
+    );
+    write_agent_config(repo.path(), "text", &agent, None);
+
+    write_review_bundle(
+        repo.path(),
+        "2026-04-04T10-00-00Z-completed",
+        Some("2026-04-04T10:00:00Z"),
+        &[ReviewCommentSpec {
+            id: "R001",
+            path: "src/completed.rs",
+            side: "new",
+            line: 2,
+            severity: "warning",
+            title: "Completed title",
+            body: "Use the completed bundle.",
+            hunk_header: Some("@@ -1,1 +1,2 @@"),
+            patch_file: Some("files/0001-src-completed.rs.patch"),
+        }],
+    );
+    write_review_bundle(
+        repo.path(),
+        "2026-04-04T11-00-00Z-running",
+        Some("2026-04-04T11:00:00Z"),
+        &[],
+    );
+    let running_manifest_path = review_bundle_path(repo.path(), "2026-04-04T11-00-00Z-running")
+        .join("manifest.json");
+    let running_manifest = fs::read_to_string(&running_manifest_path).unwrap();
+    write_file(
+        &running_manifest_path,
+        &running_manifest.replace("\"status\": \"succeeded\"", "\"status\": \"running\""),
+    );
+
+    let output = anne(repo.path(), &["address", "R001"]);
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let bundle = address_bundle_path(repo.path(), &output.stdout);
+    let manifest = fs::read_to_string(bundle.join("manifest.json")).unwrap();
+    assert!(manifest.contains("\"review_id\": \"2026-04-04T10-00-00Z-completed\""));
+
+    let selected_comments = fs::read_to_string(bundle.join("selected_comments.json")).unwrap();
+    assert!(selected_comments.contains("\"path\": \"src/completed.rs\""));
+}
+
+#[test]
+fn address_falls_back_to_running_bundle_when_no_completed_review_is_usable() {
+    let repo = TestRepo::new("running-fallback");
+    init_repo(repo.path());
+    write_init_template(repo.path());
+
+    write_review_bundle(
+        repo.path(),
+        "2026-04-04T11-30-00Z-running-only",
+        Some("2026-04-04T11:30:00Z"),
+        &[],
+    );
+    let manifest_path = review_bundle_path(repo.path(), "2026-04-04T11-30-00Z-running-only")
+        .join("manifest.json");
+    let manifest = fs::read_to_string(&manifest_path).unwrap();
+    write_file(
+        &manifest_path,
+        &manifest.replace("\"status\": \"succeeded\"", "\"status\": \"running\""),
+    );
+
+    let output = anne(repo.path(), &["address"]);
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let bundle = address_bundle_path(repo.path(), &output.stdout);
+    let address_manifest = fs::read_to_string(bundle.join("manifest.json")).unwrap();
+    assert!(address_manifest.contains("\"review_id\": \"2026-04-04T11-30-00Z-running-only\""));
+    assert!(address_manifest.contains("\"status\": \"running\""));
+
+    let summary = fs::read_to_string(bundle.join("summary.md")).unwrap();
+    assert!(summary.contains("No comments selected from the source review."));
+}
+
+#[test]
+fn address_skips_manifest_only_newer_bundle() {
+    let repo = TestRepo::new("manifest-only-fallback");
+    init_repo(repo.path());
+    write_init_template(repo.path());
+
+    let agent = agent_script(
+        repo.path(),
+        r#"cat >/dev/null
+cat <<'EOF'
+# Anne
+
+## Feature: Manifest-only fallback
+
+### Problem
+
+Manifest-only review bundles are not usable sources for address.
+
+### Goals
+
+- Skip the malformed newer bundle.
+
+### Non-Goals
+
+- Failing on the first incomplete bundle.
+
+## Proposed Approach
+
+Require all advertised public review artifacts before selecting a bundle.
+EOF
+"#,
+    );
+    write_agent_config(repo.path(), "text", &agent, None);
+
+    write_review_bundle(
+        repo.path(),
+        "2026-04-04T10-00-00Z-older-complete",
+        Some("2026-04-04T10:00:00Z"),
+        &[ReviewCommentSpec {
+            id: "R001",
+            path: "src/fallback.rs",
+            side: "new",
+            line: 2,
+            severity: "warning",
+            title: "Fallback title",
+            body: "Use the older complete bundle.",
+            hunk_header: Some("@@ -1,1 +1,2 @@"),
+            patch_file: Some("files/0001-src-fallback.rs.patch"),
+        }],
+    );
+    write_review_bundle(
+        repo.path(),
+        "2026-04-04T11-00-00Z-newer-manifest-only",
+        Some("2026-04-04T11:00:00Z"),
+        &[ReviewCommentSpec {
+            id: "R001",
+            path: "src/newer.rs",
+            side: "new",
+            line: 2,
+            severity: "warning",
+            title: "Manifest only title",
+            body: "This bundle should be skipped.",
+            hunk_header: Some("@@ -1,1 +1,2 @@"),
+            patch_file: Some("files/0001-src-newer.rs.patch"),
+        }],
+    );
+    let manifest_only_bundle = review_bundle_path(repo.path(), "2026-04-04T11-00-00Z-newer-manifest-only");
+    fs::remove_file(manifest_only_bundle.join("diff.patch")).unwrap();
+    fs::remove_file(manifest_only_bundle.join("comments.json")).unwrap();
+    fs::remove_file(manifest_only_bundle.join("comments.md")).unwrap();
+
+    let output = anne(repo.path(), &["address", "R001"]);
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let bundle = address_bundle_path(repo.path(), &output.stdout);
+    let manifest = fs::read_to_string(bundle.join("manifest.json")).unwrap();
+    assert!(manifest.contains("\"review_id\": \"2026-04-04T10-00-00Z-older-complete\""));
+}
+
+#[test]
 fn address_falls_back_when_newest_review_bundle_is_missing_comments_json() {
     let repo = TestRepo::new("missing-comments-fallback");
     init_repo(repo.path());
@@ -1480,12 +1681,16 @@ fn write_review_bundle(
         manifest.push_str(&format!(",\n  \"generated_at\": \"{generated_at}\""));
     }
     manifest.push_str(
-        ",\n  \"range\": \"main...feature\",\n  \"merge_base\": \"abc1234\",\n  \"status\": \"succeeded\",\n  \"diff_patch\": \"diff.patch\"\n}\n",
+        ",\n  \"range\": \"main...feature\",\n  \"merge_base\": \"abc1234\",\n  \"status\": \"succeeded\",\n  \"diff_patch\": \"diff.patch\",\n  \"comments_json\": \"comments.json\",\n  \"comments_markdown\": \"comments.md\"\n}\n",
     );
     write_file(&bundle.join("manifest.json"), &manifest);
     write_file(
         &bundle.join("diff.patch"),
         "diff --git a/src/lib.rs b/src/lib.rs\n@@ -1,1 +1,2 @@\n-old\n+new\n",
+    );
+    write_file(
+        &bundle.join("comments.md"),
+        "# Review: main...feature\n\n- Status: succeeded\n",
     );
 
     let mut comments_json = String::from("[\n");

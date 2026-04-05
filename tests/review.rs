@@ -2,8 +2,9 @@ use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
-    process::{Command, Output, Stdio},
-    time::{SystemTime, UNIX_EPOCH},
+    process::{Child, Command, Output, Stdio},
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use git2::{Repository, RepositoryInitOptions, StatusOptions, build::CheckoutBuilder};
@@ -525,7 +526,7 @@ fn review_preserves_explicit_text_output_with_custom_filter() {
 }
 
 #[test]
-fn review_preserves_bundle_path_when_final_output_write_fails() {
+fn review_preserves_bundle_path_when_initial_snapshot_publish_fails() {
     let repo = TestRepo::new("output-write-failure");
     init_repo(repo.path());
 
@@ -572,13 +573,116 @@ fn review_preserves_bundle_path_when_final_output_write_fails() {
     assert_eq!(stdout_bundle, bundle);
     assert!(stderr.contains("failed writing comments.md"));
 
+    let comments_json = fs::read_to_string(bundle.join("comments.json")).unwrap();
+    assert_eq!(comments_json.trim(), "[]");
+    assert!(!bundle.join("manifest.json").exists());
+    assert!(bundle.join("comments.md").is_dir());
+}
+
+#[test]
+fn review_publishes_readable_running_snapshot_before_completion() {
+    let repo = TestRepo::new("running-snapshot");
+    init_repo(repo.path());
+
+    write_file(
+        &repo.path().join("src/a.rs"),
+        "pub fn alpha() -> i32 {\n    1\n}\n",
+    );
+    write_file(
+        &repo.path().join("src/b.rs"),
+        "pub fn beta() -> i32 {\n    1\n}\n",
+    );
+    commit_all(repo.path(), "initial");
+
+    create_and_checkout_branch(repo.path(), "feature");
+    write_file(
+        &repo.path().join("src/a.rs"),
+        "pub fn alpha() -> i32 {\n    2\n}\n",
+    );
+    write_file(
+        &repo.path().join("src/b.rs"),
+        "pub fn beta() -> i32 {\n    2\n}\n",
+    );
+    commit_all(repo.path(), "feature changes");
+
+    checkout_branch(repo.path(), "main");
+
+    let agent = agent_script(
+        repo.path(),
+        r#"prompt=$(cat)
+mkdir -p .anne-test
+case "$prompt" in
+  *"Path: src/a.rs"*)
+    : > .anne-test/a-started
+    attempts=0
+    while [ ! -f .anne-test/continue ]; do
+      attempts=$((attempts + 1))
+      if [ "$attempts" -ge 100 ]; then
+        printf 'timed out waiting for continue\n' >&2
+        exit 91
+      fi
+      sleep 0.1
+    done
+    printf '[]\n'
+    ;;
+  *"Path: src/b.rs"*)
+    : > .anne-test/b-finished
+    printf '[]\n'
+    ;;
+  *)
+    printf 'unexpected prompt\n' >&2
+    exit 1
+    ;;
+esac
+"#,
+    );
+    write_agent_config_with_workers(repo.path(), "text", &agent, None, 2);
+
+    let bin_dir = repo.path().join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    fixed_date_script(&bin_dir, "2026-04-04T18:00:00Z");
+    let path_env = prepend_path(&bin_dir);
+
+    let bundle = repo.path().join(".anne/reviews").join(review_bundle_id(
+        repo.path(),
+        "main",
+        "feature",
+        "2026-04-04T18:00:00Z",
+    ));
+    let child = spawn_anne_with_path(repo.path(), &["review", "main...feature"], Some(&path_env));
+
+    wait_for(
+        "running snapshot publication",
+        || {
+            repo.path().join(".anne-test/a-started").exists()
+                && repo.path().join(".anne-test/b-finished").exists()
+                && bundle.join("manifest.json").is_file()
+                && bundle.join("comments.json").is_file()
+                && bundle.join("comments.md").exists()
+        },
+    );
+
     let manifest = fs::read_to_string(bundle.join("manifest.json")).unwrap();
-    assert!(manifest.contains("\"status\": \"failed\""));
-    assert!(manifest.contains("failed writing comments.md"));
+    assert!(manifest.contains("\"status\": \"running\""));
 
     let comments_json = fs::read_to_string(bundle.join("comments.json")).unwrap();
     assert_eq!(comments_json.trim(), "[]");
-    assert!(bundle.join("comments.md").is_dir());
+
+    let comments_md = fs::read_to_string(bundle.join("comments.md")).unwrap();
+    assert!(comments_md.contains("This review is still running."));
+    assert!(comments_md.contains("## src/a.rs"));
+    assert!(comments_md.contains("Review running."));
+    assert!(comments_md.contains("## src/b.rs"));
+    assert!(comments_md.contains("Review complete for this file."));
+
+    write_file(&repo.path().join(".anne-test/continue"), "continue\n");
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
@@ -1739,6 +1843,19 @@ fn anne_with_path(path: &Path, args: &[&str], path_env: Option<&str>) -> Output 
     command.output().unwrap()
 }
 
+fn spawn_anne_with_path(path: &Path, args: &[&str], path_env: Option<&str>) -> Child {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_anne"));
+    command.args(args).current_dir(path);
+    if let Some(path_env) = path_env {
+        command.env("PATH", path_env);
+    }
+    command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
 fn run_executable_with_stdin(executable: &Path, input: &str, path_env: Option<&str>) -> Output {
     let mut command = Command::new(executable);
     command.current_dir(env!("CARGO_MANIFEST_DIR"));
@@ -1757,6 +1874,18 @@ fn run_executable_with_stdin(executable: &Path, input: &str, path_env: Option<&s
     }
     drop(child.stdin.take());
     child.wait_with_output().unwrap()
+}
+
+fn wait_for(label: &str, predicate: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if predicate() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+
+    panic!("timed out waiting for {label}");
 }
 
 fn cargo_stdout(repo_root: &Path, args: &[&str]) -> String {

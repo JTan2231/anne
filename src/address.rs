@@ -297,8 +297,31 @@ fn discover_review_context(repo_root: &Path) -> Result<ReviewContext, String> {
 
     sort_review_candidates(&mut candidates);
 
+    let mut completed_candidates = Vec::new();
+    let mut running_candidates = Vec::new();
     let mut skipped = Vec::new();
     for candidate in candidates.into_iter().rev() {
+        match candidate.selection_preference() {
+            Ok(ReviewCandidatePreference::Completed) => completed_candidates.push(candidate),
+            Ok(ReviewCandidatePreference::Running) => running_candidates.push(candidate),
+            Err(reason) => skipped.push(SkippedReviewCandidate {
+                review_id: candidate.review_id,
+                reason,
+            }),
+        }
+    }
+
+    for candidate in completed_candidates {
+        match load_review_context(&candidate) {
+            Ok(context) => return Ok(context),
+            Err(reason) => skipped.push(SkippedReviewCandidate {
+                review_id: candidate.review_id,
+                reason,
+            }),
+        }
+    }
+
+    for candidate in running_candidates {
         match load_review_context(&candidate) {
             Ok(context) => return Ok(context),
             Err(reason) => skipped.push(SkippedReviewCandidate {
@@ -323,6 +346,8 @@ fn read_review_manifest(bundle_root: &Path) -> Option<ReviewManifest> {
         merge_base: object_string(object, "merge_base"),
         status: object_string(object, "status"),
         diff_patch: object_string(object, "diff_patch"),
+        comments_json: object_string(object, "comments_json"),
+        comments_markdown: object_string(object, "comments_markdown"),
     })
 }
 
@@ -387,12 +412,33 @@ fn sort_review_candidates(candidates: &mut [ReviewCandidate]) {
 }
 
 fn load_review_context(candidate: &ReviewCandidate) -> Result<ReviewContext, String> {
-    let comments_path = candidate.bundle_root.join("comments.json");
-    let comments_text = fs::read_to_string(&comments_path)
-        .map_err(|error| format!("comments.json was not readable: {error}"))?;
+    let manifest = candidate
+        .manifest
+        .as_ref()
+        .ok_or_else(|| "manifest.json was not readable or valid".to_string())?;
+    let diff_patch = manifest
+        .diff_patch
+        .as_deref()
+        .ok_or_else(|| "manifest.json did not advertise diff.patch".to_string())?;
+    read_bundle_artifact(&candidate.bundle_root, diff_patch, "diff.patch")?;
+    let comments_markdown = manifest
+        .comments_markdown
+        .as_deref()
+        .ok_or_else(|| "manifest.json did not advertise comments.md".to_string())?;
+    read_bundle_artifact(&candidate.bundle_root, comments_markdown, "comments.md")?;
+    let comments_json = manifest
+        .comments_json
+        .as_deref()
+        .ok_or_else(|| "manifest.json did not advertise comments.json".to_string())?;
+    let comments_text = read_bundle_artifact(&candidate.bundle_root, comments_json, "comments.json")?;
     let comments = parse_comments(&comments_text)
         .map_err(|error| format!("comments.json was not valid: {error}"))?;
     Ok(candidate.review_context(comments))
+}
+
+fn read_bundle_artifact(bundle_root: &Path, relative_path: &str, label: &str) -> Result<String, String> {
+    fs::read_to_string(bundle_root.join(relative_path))
+        .map_err(|error| format!("{label} was not readable: {error}"))
 }
 
 fn process_comment(
@@ -959,6 +1005,8 @@ struct ReviewManifest {
     merge_base: Option<String>,
     status: Option<String>,
     diff_patch: Option<String>,
+    comments_json: Option<String>,
+    comments_markdown: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -969,6 +1017,19 @@ struct ReviewCandidate {
 }
 
 impl ReviewCandidate {
+    fn selection_preference(&self) -> Result<ReviewCandidatePreference, String> {
+        let manifest = self
+            .manifest
+            .as_ref()
+            .ok_or_else(|| "manifest.json was not readable or valid".to_string())?;
+        match manifest.status.as_deref() {
+            Some("succeeded") | Some("failed") => Ok(ReviewCandidatePreference::Completed),
+            Some("running") => Ok(ReviewCandidatePreference::Running),
+            Some(status) => Err(format!("manifest status `{status}` was not supported")),
+            None => Err("manifest.json did not contain a supported status".to_string()),
+        }
+    }
+
     fn generated_at(&self) -> Option<&String> {
         self.manifest
             .as_ref()
@@ -1010,6 +1071,12 @@ impl ReviewCandidate {
 struct SkippedReviewCandidate {
     review_id: String,
     reason: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ReviewCandidatePreference {
+    Completed,
+    Running,
 }
 
 #[derive(Debug, Clone)]
@@ -1504,6 +1571,8 @@ mod tests {
                     merge_base: None,
                     status: None,
                     diff_patch: None,
+                    comments_json: None,
+                    comments_markdown: None,
                 }),
             },
             ReviewCandidate {
@@ -1515,6 +1584,8 @@ mod tests {
                     merge_base: None,
                     status: None,
                     diff_patch: None,
+                    comments_json: None,
+                    comments_markdown: None,
                 }),
             },
         ];
