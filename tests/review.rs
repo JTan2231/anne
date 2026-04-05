@@ -1500,12 +1500,13 @@ fn default_filter_keeps_final_agent_message_over_warning_fallback() {
 }
 
 #[test]
-fn tracked_src_and_tests_rust_files_and_shell_scripts_do_not_invoke_git_cli() {
+fn repo_layout_rust_and_shell_files_do_not_invoke_git_cli() {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let files = tracked_git_cli_guard_files(repo_root);
-    let (rust_files, shell_files): (Vec<_>, Vec<_>) = files
-        .into_iter()
-        .partition(|path| path.extension().and_then(|ext| ext.to_str()) == Some("rs"));
+    let files = repo_layout_git_cli_guard_files(repo_root).unwrap();
+    let shell_files = files
+        .iter()
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("sh"))
+        .collect::<Vec<_>>();
 
     for expected in [
         Path::new("ci.sh"),
@@ -1513,45 +1514,119 @@ fn tracked_src_and_tests_rust_files_and_shell_scripts_do_not_invoke_git_cli() {
         Path::new("examples/agents/default/filter.sh"),
     ] {
         assert!(
-            shell_files.iter().any(|path| path == expected),
-            "tracked shell guard unexpectedly omitted {}",
+            shell_files.iter().any(|path| *path == expected),
+            "repo-layout shell guard unexpectedly omitted {}",
             expected.display()
         );
     }
 
-    let double_quote = "\"";
-    let single_quote = "'";
-    let forbidden_command_patterns = [
-        format!("Command::new({double_quote}git{double_quote})"),
-        format!("Command::new({single_quote}git{single_quote})"),
-        format!("Command::new({double_quote}/usr/bin/git{double_quote})"),
-    ];
-
-    for file in rust_files {
-        let contents = fs::read_to_string(repo_root.join(&file)).unwrap();
-        for pattern in &forbidden_command_patterns {
-            assert!(
-                !contents.contains(pattern),
-                "forbidden Git CLI invocation pattern `{pattern}` found in tracked Rust file {}",
-                file.display()
-            );
-        }
+    if let Err(error) = check_repo_layout_git_cli_guard(repo_root) {
+        panic!("{error}");
     }
+}
 
-    for file in shell_files {
-        let contents = fs::read_to_string(repo_root.join(&file)).unwrap();
-        for (index, line) in contents.lines().enumerate() {
-            let trimmed = line.trim_start();
-            let starts_git = trimmed.starts_with("git ") || trimmed.starts_with("git\t");
-            let execs_git = trimmed.starts_with("exec git ") || trimmed.starts_with("exec git\t");
-            assert!(
-                !starts_git && !execs_git,
-                "forbidden shell Git CLI invocation found in tracked shell file {}:{}",
-                file.display(),
-                index + 1
-            );
-        }
-    }
+#[test]
+fn repo_layout_git_cli_guard_discovers_new_shell_scripts_and_skips_excluded_dirs() {
+    let repo = TestRepo::new("git-cli-guard-discovery");
+    write_file(
+        &repo.path().join("src/lib.rs"),
+        "pub fn value() -> i32 {\n    1\n}\n",
+    );
+    write_file(
+        &repo.path().join("tests/review_helper.rs"),
+        "#[test]\nfn helper() {}\n",
+    );
+    write_executable(&repo.path().join("ci.sh"), "#!/bin/sh\nexit 0\n");
+    write_executable(
+        &repo.path().join("scripts/new-tool.sh"),
+        "#!/bin/sh\nexit 0\n",
+    );
+    write_executable(
+        &repo.path().join("examples/agents/custom/helper.sh"),
+        "#!/bin/sh\nexit 0\n",
+    );
+    write_executable(
+        &repo.path().join(".anne/reviews/ignored.sh"),
+        "#!/bin/sh\nexec git status\n",
+    );
+    write_executable(
+        &repo.path().join(".git/hooks/pre-commit.sh"),
+        "#!/bin/sh\nexec git status\n",
+    );
+    write_executable(
+        &repo.path().join("target/generated/ignored.sh"),
+        "#!/bin/sh\nexec git status\n",
+    );
+
+    let files = repo_layout_git_cli_guard_files(repo.path()).unwrap();
+    assert_eq!(
+        files,
+        vec![
+            PathBuf::from("ci.sh"),
+            PathBuf::from("examples/agents/custom/helper.sh"),
+            PathBuf::from("scripts/new-tool.sh"),
+            PathBuf::from("src/lib.rs"),
+            PathBuf::from("tests/review_helper.rs"),
+        ]
+    );
+}
+
+#[test]
+fn repo_layout_git_cli_guard_treats_missing_optional_directories_as_empty() {
+    let repo = TestRepo::new("git-cli-guard-empty");
+
+    let files = repo_layout_git_cli_guard_files(repo.path()).unwrap();
+    assert!(files.is_empty(), "unexpected guard files: {files:?}");
+    check_repo_layout_git_cli_guard(repo.path()).unwrap();
+}
+
+#[test]
+fn repo_layout_git_cli_guard_reports_new_shell_violations_with_line_numbers() {
+    let repo = TestRepo::new("git-cli-guard-shell-violation");
+    write_executable(
+        &repo.path().join("scripts/new-tool.sh"),
+        "#!/bin/sh\nprintf 'ok\\n'\nexec git status\n",
+    );
+
+    let error = check_repo_layout_git_cli_guard(repo.path()).unwrap_err();
+    assert!(
+        error.contains("scripts/new-tool.sh:3"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn repo_layout_git_cli_guard_reports_rust_violations_with_patterns() {
+    let repo = TestRepo::new("git-cli-guard-rust-violation");
+    write_file(
+        &repo.path().join("src/lib.rs"),
+        "use std::process::Command;\n\npub fn run() {\n    let _ = Command::new(\"git\");\n}\n",
+    );
+
+    let error = check_repo_layout_git_cli_guard(repo.path()).unwrap_err();
+    assert!(error.contains("src/lib.rs"), "unexpected error: {error}");
+    assert!(
+        error.contains("Command::new(\"git\")"),
+        "unexpected error: {error}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn repo_layout_git_cli_guard_fails_when_a_matched_file_is_unreadable() {
+    let repo = TestRepo::new("git-cli-guard-unreadable");
+    let blocked = repo.path().join("scripts/blocked.sh");
+    write_executable(&blocked, "#!/bin/sh\nexit 0\n");
+
+    set_mode(&blocked, 0o000);
+    let result = check_repo_layout_git_cli_guard(repo.path());
+    set_mode(&blocked, 0o755);
+
+    let error = result.unwrap_err();
+    assert!(
+        error.contains("failed reading guard file scripts/blocked.sh"),
+        "unexpected error: {error}"
+    );
 }
 
 #[test]
@@ -2054,36 +2129,173 @@ fn head_commit(repo: &Repository) -> git2::Commit<'_> {
     repo.find_commit(oid).unwrap()
 }
 
-fn tracked_git_cli_guard_files(repo_root: &Path) -> Vec<PathBuf> {
-    let repo = Repository::open(repo_root).unwrap_or_else(|error| {
-        panic!(
-            "failed opening repository at {}: {error}",
-            repo_root.display()
-        )
-    });
-    let index = repo.index().unwrap_or_else(|error| {
-        panic!(
-            "failed loading repository index at {}: {error}",
-            repo_root.display()
-        )
-    });
-    let mut files = index
-        .iter()
-        .filter_map(|entry| {
-            let path = PathBuf::from(String::from_utf8_lossy(&entry.path).into_owned());
-            tracked_git_cli_guard_path(&path).then_some(path)
-        })
-        .collect::<Vec<_>>();
+const GIT_CLI_GUARD_EXCLUDED_DIRS: &[&str] = &[".anne", ".git", "target"];
+
+fn repo_layout_git_cli_guard_files(repo_root: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut files = collect_guard_files_in_subtree(repo_root, Path::new("src"), "rs")?;
+    files.extend(collect_guard_files_in_subtree(
+        repo_root,
+        Path::new("tests"),
+        "rs",
+    )?);
+    files.extend(collect_shell_guard_files(repo_root)?);
     files.sort();
-    files
+    files.dedup();
+    Ok(files)
 }
 
-fn tracked_git_cli_guard_path(path: &Path) -> bool {
-    match path.extension().and_then(|ext| ext.to_str()) {
-        Some("rs") => path.starts_with("src") || path.starts_with("tests"),
-        Some("sh") => true,
-        _ => false,
+fn collect_guard_files_in_subtree(
+    repo_root: &Path,
+    relative_dir: &Path,
+    extension: &str,
+) -> Result<Vec<PathBuf>, String> {
+    let root = repo_root.join(relative_dir);
+    if !root.exists() {
+        return Ok(Vec::new());
     }
+    if !root.is_dir() {
+        return Err(format!(
+            "guard subtree {} is not a directory",
+            relative_dir.display()
+        ));
+    }
+
+    let mut files = Vec::new();
+    collect_guard_files(&root, relative_dir, extension, false, &mut files)?;
+    Ok(files)
+}
+
+fn collect_shell_guard_files(repo_root: &Path) -> Result<Vec<PathBuf>, String> {
+    if !repo_root.is_dir() {
+        return Err(format!(
+            "guard root {} is not a directory",
+            repo_root.display()
+        ));
+    }
+
+    let mut files = Vec::new();
+    collect_guard_files(repo_root, Path::new(""), "sh", true, &mut files)?;
+    Ok(files)
+}
+
+fn collect_guard_files(
+    current_dir: &Path,
+    current_relative: &Path,
+    extension: &str,
+    exclude_guard_dirs: bool,
+    files: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    let entries = fs::read_dir(current_dir).map_err(|error| {
+        format!(
+            "failed reading guard directory {}: {error}",
+            current_dir.display()
+        )
+    })?;
+
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            format!(
+                "failed iterating guard directory {}: {error}",
+                current_dir.display()
+            )
+        })?;
+        let file_type = entry.file_type().map_err(|error| {
+            format!(
+                "failed reading guard entry type {}: {error}",
+                entry.path().display()
+            )
+        })?;
+        let file_name = entry.file_name();
+        let relative_path = if current_relative.as_os_str().is_empty() {
+            PathBuf::from(&file_name)
+        } else {
+            current_relative.join(&file_name)
+        };
+
+        if file_type.is_dir() {
+            let excluded = exclude_guard_dirs
+                && file_name
+                    .to_str()
+                    .is_some_and(|name| GIT_CLI_GUARD_EXCLUDED_DIRS.contains(&name));
+            if excluded {
+                continue;
+            }
+            collect_guard_files(
+                &entry.path(),
+                &relative_path,
+                extension,
+                exclude_guard_dirs,
+                files,
+            )?;
+            continue;
+        }
+
+        if file_type.is_file()
+            && relative_path.extension().and_then(|ext| ext.to_str()) == Some(extension)
+        {
+            files.push(relative_path);
+        }
+    }
+
+    Ok(())
+}
+
+fn check_repo_layout_git_cli_guard(repo_root: &Path) -> Result<(), String> {
+    let files = repo_layout_git_cli_guard_files(repo_root)?;
+    let double_quote = "\"";
+    let single_quote = "'";
+    let forbidden_command_patterns = [
+        format!("Command::new({double_quote}git{double_quote})"),
+        format!("Command::new({single_quote}git{single_quote})"),
+        format!("Command::new({double_quote}/usr/bin/git{double_quote})"),
+    ];
+
+    for file in files {
+        let contents = fs::read_to_string(repo_root.join(&file))
+            .map_err(|error| format!("failed reading guard file {}: {error}", file.display()))?;
+
+        match file.extension().and_then(|ext| ext.to_str()) {
+            Some("rs") => {
+                for pattern in &forbidden_command_patterns {
+                    if contents.contains(pattern) {
+                        return Err(format!(
+                            "forbidden Git CLI invocation pattern `{pattern}` found in Rust guard file {}",
+                            file.display()
+                        ));
+                    }
+                }
+            }
+            Some("sh") => {
+                for (index, line) in contents.lines().enumerate() {
+                    let trimmed = line.trim_start();
+                    let starts_git = trimmed.starts_with("git ") || trimmed.starts_with("git\t");
+                    let execs_git =
+                        trimmed.starts_with("exec git ") || trimmed.starts_with("exec git\t");
+                    if starts_git || execs_git {
+                        return Err(format!(
+                            "forbidden shell Git CLI invocation found in shell guard file {}:{}",
+                            file.display(),
+                            index + 1
+                        ));
+                    }
+                }
+            }
+            Some(other) => {
+                return Err(format!(
+                    "unexpected guard file extension `{other}` for {}",
+                    file.display()
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "guard file {} is missing an extension",
+                    file.display()
+                ));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn write_file(path: &Path, contents: &str) {
