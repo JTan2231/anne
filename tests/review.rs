@@ -401,6 +401,80 @@ fn review_skips_bundled_default_filter_when_jq_is_missing() {
 }
 
 #[test]
+fn review_allows_default_label_with_custom_command_and_explicit_empty_filter() {
+    let repo = TestRepo::new("default-label-custom-command-no-filter");
+    init_repo(repo.path());
+
+    write_file(
+        &repo.path().join("src/lib.rs"),
+        "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n",
+    );
+    commit_all(repo.path(), "initial");
+
+    create_and_checkout_branch(repo.path(), "feature");
+    write_file(
+        &repo.path().join("src/lib.rs"),
+        "pub fn add(a: i32, b: i32) -> i32 {\n    a + b + 1\n}\n",
+    );
+    commit_all(repo.path(), "feature changes");
+
+    checkout_branch(repo.path(), "main");
+
+    let agent = agent_script(
+        repo.path(),
+        "while IFS= read -r _line; do :; done\nprintf '[{\"path\":\"src/lib.rs\",\"side\":\"new\",\"line\":2,\"severity\":\"warning\",\"title\":\"Explicit filter disable respected\",\"body\":\"Anne kept the explicit custom command and did not re-enable the bundled filter.\"}]\\n'\n",
+    );
+
+    write_file(
+        &repo.path().join(".anne/config.toml"),
+        &format!(
+            "\
+[agent]
+label = \"default\"
+command = [\"{}\"]
+progress_filter = []
+output = \"text\"
+enable_script_wrapper = false
+workers = 4
+
+[review]
+max_patch_bytes = 4096
+ignore_prefixes = [\"vendor/\"]
+",
+            agent.display()
+        ),
+    );
+
+    let output = anne_with_path(repo.path(), &["review", "main...feature"], Some(""));
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stderr)
+            .contains("Bundled default progress filter skipped")
+    );
+
+    let bundle = bundle_path(repo.path(), &output.stdout);
+    let comments_json = fs::read_to_string(bundle.join("comments.json")).unwrap();
+    assert!(comments_json.contains("\"title\": \"Explicit filter disable respected\""));
+
+    let manifest = fs::read_to_string(bundle.join("manifest.json")).unwrap();
+    assert!(manifest.contains("\"label\": \"default\""));
+    assert!(manifest.contains(&agent.display().to_string()));
+    assert!(manifest.contains("\"command_source\": \"explicit\""));
+    assert!(manifest.contains("\"progress_filter\": []"));
+    assert!(manifest.contains("\"progress_filter_source\": \"explicit\""));
+    assert!(manifest.contains("\"bundled_filter_requested\": false"));
+    assert!(manifest.contains("\"progress_filter_ran\": false"));
+    assert!(manifest.contains("\"assistant_text_source\": \"raw-stdout\""));
+    assert!(!manifest.contains("default/filter.sh"));
+    assert!(!manifest.contains("jq was not found on PATH"));
+}
+
+#[test]
 fn review_preserves_bundle_path_when_final_output_write_fails() {
     let repo = TestRepo::new("output-write-failure");
     init_repo(repo.path());
