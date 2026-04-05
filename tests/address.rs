@@ -7,6 +7,10 @@ use std::{
 
 use git2::{Repository, RepositoryInitOptions};
 
+#[allow(dead_code)]
+#[path = "../src/json.rs"]
+mod fixture_json;
+
 #[test]
 fn address_selects_newest_review_and_generates_specs_for_all_comments() {
     let repo = TestRepo::new("all-comments");
@@ -721,6 +725,76 @@ EOF
     let selected_comments = fs::read_to_string(bundle.join("selected_comments.json")).unwrap();
     assert!(selected_comments.contains("\"path\": \"src/older.rs\""));
     assert!(!selected_comments.contains("\"path\": \"src/newer.rs\""));
+}
+
+#[test]
+fn address_accepts_json_escaped_comment_text_in_synthetic_review_fixtures() {
+    let repo = TestRepo::new("escaped-comment-fixture");
+    init_repo(repo.path());
+    write_init_template(repo.path());
+
+    let agent = agent_script(
+        repo.path(),
+        r#"cat >/dev/null
+cat <<'EOF'
+# Anne
+
+## Feature: Escaped comment fixture
+
+### Problem
+
+Synthetic review fixtures must preserve JSON-sensitive comment text.
+
+### Goals
+
+- Exercise normal address generation with decoded source-comment text.
+
+### Non-Goals
+
+- Requiring fixture authors to hand-escape JSON strings.
+
+## Proposed Approach
+
+Keep fixture serialization JSON-safe so prompt construction sees the original text.
+EOF
+"#,
+    );
+    write_agent_config(repo.path(), "text", &agent, None);
+
+    let title = r#"Escaped "title""#;
+    let body = "First line with a quote: \"\nSecond line with a backslash: \\";
+    let hunk_header = r#"@@ -1,"old" +1,2 @@ \\context"#;
+    write_review_bundle(
+        repo.path(),
+        "2026-04-04T11-30-00Z-escaped-comment-fixture",
+        Some("2026-04-04T11:30:00Z"),
+        &[ReviewCommentSpec {
+            id: "R001",
+            path: "src/escaped.rs",
+            side: "new",
+            line: 4,
+            severity: "warning",
+            title,
+            body,
+            hunk_header: Some(hunk_header),
+            patch_file: Some("files/0001-src-escaped.rs.patch"),
+        }],
+    );
+
+    let output = anne(repo.path(), &["address", "R001"]);
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let bundle = address_bundle_path(repo.path(), &output.stdout);
+    let prompt = fs::read_to_string(bundle.join("agent/R001.prompt.md")).unwrap();
+    assert!(prompt.contains(&format!("- Title: {title}\n")));
+    assert!(prompt.contains(&format!("- Hunk header: {hunk_header}\n")));
+    assert!(prompt.contains(&format!("Comment body:\n{body}\n\n")));
+    assert!(bundle.join("specs/R001-Escaped-title.md").exists());
 }
 
 #[test]
@@ -1784,19 +1858,8 @@ fn write_review_bundle(
 
     let mut comments_json = String::from("[\n");
     for (index, comment) in comments.iter().enumerate() {
-        comments_json.push_str("  {\n");
-        comments_json.push_str(&format!("    \"id\": \"{}\",\n", comment.id));
-        comments_json.push_str(&format!("    \"path\": \"{}\",\n", comment.path));
-        comments_json.push_str(&format!("    \"side\": \"{}\",\n", comment.side));
-        comments_json.push_str(&format!("    \"line\": {},\n", comment.line));
-        comments_json.push_str(&format!("    \"severity\": \"{}\",\n", comment.severity));
-        comments_json.push_str(&format!("    \"title\": \"{}\",\n", comment.title));
-        comments_json.push_str(&format!("    \"body\": \"{}\"", comment.body));
-        if let Some(hunk_header) = comment.hunk_header {
-            comments_json.push_str(&format!(",\n    \"hunk_header\": \"{}\"", hunk_header));
-        }
+        comments_json.push_str(&render_review_comment_json(comment));
         if let Some(patch_file) = comment.patch_file {
-            comments_json.push_str(&format!(",\n    \"patch_file\": \"{}\"", patch_file));
             write_file(
                 &bundle.join(patch_file),
                 &format!(
@@ -1806,7 +1869,6 @@ fn write_review_bundle(
                 ),
             );
         }
-        comments_json.push_str("\n  }");
         if index + 1 != comments.len() {
             comments_json.push(',');
         }
@@ -1814,6 +1876,77 @@ fn write_review_bundle(
     }
     comments_json.push_str("]\n");
     write_file(&bundle.join("comments.json"), &comments_json);
+    assert_valid_comments_json(&comments_json);
+}
+
+fn render_review_comment_json(comment: &ReviewCommentSpec<'_>) -> String {
+    let mut output = String::from("  {\n");
+    output.push_str(&format!(
+        "    \"id\": {},\n",
+        render_json_string(comment.id)
+    ));
+    output.push_str(&format!(
+        "    \"path\": {},\n",
+        render_json_string(comment.path)
+    ));
+    output.push_str(&format!(
+        "    \"side\": {},\n",
+        render_json_string(comment.side)
+    ));
+    output.push_str(&format!("    \"line\": {},\n", comment.line));
+    output.push_str(&format!(
+        "    \"severity\": {},\n",
+        render_json_string(comment.severity)
+    ));
+    output.push_str(&format!(
+        "    \"title\": {},\n",
+        render_json_string(comment.title)
+    ));
+    output.push_str(&format!(
+        "    \"body\": {}",
+        render_json_string(comment.body)
+    ));
+    if let Some(hunk_header) = comment.hunk_header {
+        output.push_str(&format!(
+            ",\n    \"hunk_header\": {}",
+            render_json_string(hunk_header)
+        ));
+    }
+    if let Some(patch_file) = comment.patch_file {
+        output.push_str(&format!(
+            ",\n    \"patch_file\": {}",
+            render_json_string(patch_file)
+        ));
+    }
+    output.push_str("\n  }");
+    output
+}
+
+fn render_json_string(value: &str) -> String {
+    let mut output = String::from("\"");
+    for ch in value.chars() {
+        match ch {
+            '"' => output.push_str("\\\""),
+            '\\' => output.push_str("\\\\"),
+            '\n' => output.push_str("\\n"),
+            '\r' => output.push_str("\\r"),
+            '\t' => output.push_str("\\t"),
+            ch if ch.is_control() => output.push_str(&format!("\\u{:04x}", ch as u32)),
+            _ => output.push(ch),
+        }
+    }
+    output.push('"');
+    output
+}
+
+fn assert_valid_comments_json(text: &str) {
+    let parsed = fixture_json::parse(text).unwrap_or_else(|error| {
+        panic!("write_review_bundle emitted invalid comments.json: {error}")
+    });
+    assert!(
+        parsed.as_array().is_some(),
+        "write_review_bundle must emit a comments.json array"
+    );
 }
 
 fn write_agent_config(path: &Path, output: &str, agent: &Path, filter: Option<&Path>) {

@@ -1,0 +1,16 @@
+{
+  "plan_id": "pln_f2720b8118c74d68b183a19d186e0df7",
+  "slug": "r020-fixture-builder-does-not-es",
+  "branch": "draft/r020-fixture-builder-does-not-es",
+  "source": "inline",
+  "intent": null,
+  "target_branch": null,
+  "work_ref": "workflow-job:wf-run_c1671de9d1cb4538b5e2ec86fa1e96bd-develop_draft__persist_plan",
+  "status": "proposed",
+  "summary": "Harden the tests/address.rs synthetic review bundle builder so comments.json escapes arbitrary comment text and round-trips through anne address.",
+  "created_at": "2026-04-05T06:39:38.415132860+00:00",
+  "updated_at": "2026-04-05T06:39:38.415132860+00:00",
+  "job_ids": {
+    "persist": "wf-run_c1671de9d1cb4538b5e2ec86fa1e96bd-develop_draft__persist_plan"
+  }
+}
