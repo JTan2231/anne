@@ -1,7 +1,8 @@
 use std::{
     fs,
+    io::Write,
     path::{Path, PathBuf},
-    process::{Command, Output},
+    process::{Command, Output, Stdio},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -839,6 +840,63 @@ fn review_skips_pure_renames_from_git2_diff_data() {
 }
 
 #[test]
+fn default_filter_uses_item_message_for_warning_fallback_and_preserves_last_payload() {
+    let repo = TestRepo::new("default-filter-warning-fallback");
+    let bin_dir = repo.path().join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    jq_script(&bin_dir);
+
+    let input = concat!(
+        "{\"type\":\"item.completed\",\"item\":{\"type\":\"error\",\"message\":\"warning payload\\nfrom item.message\"}}\n",
+        "{\"type\":\"item.completed\",\"item\":{\"type\":\"error\"}}\n",
+    );
+    let output =
+        run_executable_with_stdin(&default_filter_script(), input, Some(&prepend_path(&bin_dir)));
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "warning payload from item.message\n"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("error: warning payload from item.message"));
+    assert!(stderr.contains("error update"));
+}
+
+#[test]
+fn default_filter_keeps_final_agent_message_over_warning_fallback() {
+    let repo = TestRepo::new("default-filter-agent-message-precedence");
+    let bin_dir = repo.path().join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    jq_script(&bin_dir);
+
+    let input = concat!(
+        "{\"type\":\"item.completed\",\"item\":{\"type\":\"error\",\"message\":\"warning payload\"}}\n",
+        "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"[]\"}}\n",
+    );
+    let output =
+        run_executable_with_stdin(&default_filter_script(), input, Some(&prepend_path(&bin_dir)));
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "[]\n");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("error: warning payload"));
+    assert!(stderr.contains("agent reply received"));
+}
+
+#[test]
 fn tracked_src_and_tests_rust_files_and_shell_scripts_do_not_invoke_git_cli() {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let files = tracked_git_cli_guard_files(repo_root);
@@ -1110,6 +1168,7 @@ value = {
     'try .thread_id // ""': get_path("thread_id"),
     'try .item.type // ""': get_path("item", "type"),
     'try .item.text // ""': get_path("item", "text"),
+    'try .item.message // ""': get_path("item", "message"),
     'try .item.status // ""': get_path("item", "status"),
     'try (.item.progress // .progress) // ""': coalesce(
         get_path("item", "progress"),
@@ -1197,6 +1256,10 @@ fn prepend_path(dir: &Path) -> String {
     }
 }
 
+fn default_filter_script() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/agents/default/filter.sh")
+}
+
 fn anne(path: &Path, args: &[&str]) -> Output {
     anne_with_path(path, args, None)
 }
@@ -1208,6 +1271,26 @@ fn anne_with_path(path: &Path, args: &[&str], path_env: Option<&str>) -> Output 
         command.env("PATH", path_env);
     }
     command.output().unwrap()
+}
+
+fn run_executable_with_stdin(executable: &Path, input: &str, path_env: Option<&str>) -> Output {
+    let mut command = Command::new(executable);
+    command.current_dir(env!("CARGO_MANIFEST_DIR"));
+    if let Some(path_env) = path_env {
+        command.env("PATH", path_env);
+    }
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = command.spawn().unwrap();
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        stdin.write_all(input.as_bytes()).unwrap();
+    }
+    drop(child.stdin.take());
+    child.wait_with_output().unwrap()
 }
 
 fn cargo_stdout(repo_root: &Path, args: &[&str]) -> String {

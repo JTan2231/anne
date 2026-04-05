@@ -71,6 +71,22 @@ progress() {
   [ -n "$msg" ] && printf '%s\n' "$msg" >&2
 }
 
+fallback_item_summary() {
+  summary=$(collapse "$1")
+  if [ -n "$summary" ]; then
+    printf '%s' "$summary"
+    return
+  fi
+
+  summary=$(collapse "$2")
+  if [ -n "$summary" ]; then
+    printf '%s' "$summary"
+    return
+  fi
+
+  printf '%s' "$(collapse "$3")"
+}
+
 final_text=""
 fallback_text=""
 
@@ -109,6 +125,7 @@ while IFS= read -r line; do
     item.started|item.completed)
       item_type=$(printf '%s' "$line" | jq -r 'try .item.type // ""' 2>/dev/null)
       item_text=$(printf '%s' "$line" | jq -r 'try .item.text // ""' 2>/dev/null)
+      item_message=$(printf '%s' "$line" | jq -r 'try .item.message // ""' 2>/dev/null)
       item_status=$(printf '%s' "$line" | jq -r 'try .item.status // ""' 2>/dev/null)
       item_progress=$(printf '%s' "$line" | jq -r 'try (.item.progress // .progress) // ""' 2>/dev/null)
 
@@ -152,8 +169,7 @@ while IFS= read -r line; do
           ;;
 
         *)
-          summary=$(collapse "$item_text")
-          [ -z "$summary" ] && summary=$(collapse "$item_status")
+          summary=$(fallback_item_summary "$item_text" "$item_message" "$item_status")
           [ -n "$summary" ] && fallback_text="$summary"
           if [ -n "$summary" ]; then
             progress "$(paint 90 "$item_type: $summary")"
