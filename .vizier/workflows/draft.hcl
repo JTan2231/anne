@@ -14,7 +14,7 @@ params = {
   commit_message = "chore: workflow stage commit"
   slug = ""
   spec_file = ""
-  spec_source = "file"
+  spec_source = "inline"
   spec_text = ""
 }
 
@@ -43,66 +43,8 @@ nodes = [
       purpose = "stage-draft"
     }
     on = {
-      succeeded = ["validate_provenance"]
-    }
-  },
-  {
-    id = "validate_provenance"
-    name = "Draft / Validate Provenance"
-    kind = "shell"
-    uses = "cap.env.shell.command.run"
-    args = {
-      script = <<-SCRIPT
-set -euo pipefail
-
-spec_file="$${spec_file}"
-spec_source="$(printf '%s' "$${spec_source}" | tr '[:upper:]' '[:lower:]')"
-
-case "$spec_source" in
-  file)
-    if [ -z "$spec_file" ]; then
-      printf 'draft provenance mismatch: spec_source=file requires spec_file\\n' >&2
-      exit 1
-    fi
-    SPEC_FILE="$spec_file" python3 - <<'PY'
-from pathlib import Path
-import os
-import sys
-
-root = Path.cwd().resolve()
-spec_file = os.environ["SPEC_FILE"]
-spec_path = (root / spec_file).resolve()
-if not spec_path.exists():
-    sys.stderr.write(
-        f"draft provenance mismatch: spec_file `{spec_file}` does not exist\\n"
-    )
-    raise SystemExit(1)
-try:
-    spec_path.relative_to(root)
-except ValueError:
-    sys.stderr.write(
-        f"draft provenance mismatch: spec_file `{spec_file}` is outside the repository root\\n"
-    )
-    raise SystemExit(1)
-PY
-    ;;
-  inline|stdin)
-    if [ -n "$spec_file" ]; then
-      printf 'draft provenance mismatch: spec_file=%s requires spec_source=file\\n' "$spec_file" >&2
-      exit 1
-    fi
-    ;;
-  *)
-    printf 'draft provenance mismatch: unsupported spec_source `%s`\\n' "$spec_source" >&2
-    exit 1
-    ;;
-esac
-SCRIPT
-    }
-    on = {
       succeeded = ["resolve_prompt"]
     }
-    after = [{ node_id = "worktree_prepare" }]
   },
   {
     id = "resolve_prompt"
@@ -110,31 +52,7 @@ SCRIPT
     kind = "builtin"
     uses = "cap.env.builtin.prompt.resolve"
     args = {
-      script = <<-SCRIPT
-set -euo pipefail
-
-spec_file="$${spec_file}"
-SPEC_FILE="$spec_file" python3 - <<'PY'
-from pathlib import Path
-import os
-import sys
-
-template = Path(".vizier/prompts/DRAFT_PROMPTS.md").read_text()
-spec_file = os.environ.get("SPEC_FILE", "").strip()
-
-if spec_file:
-    marker = "{{persist_plan.spec_text}}"
-    if marker not in template:
-        sys.stderr.write(
-            "draft prompt template is missing {{persist_plan.spec_text}}\\n"
-        )
-        raise SystemExit(1)
-    spec_text = Path(spec_file).read_text()
-    sys.stdout.write(template.replace(marker, spec_text, 1))
-else:
-    sys.stdout.write(template)
-PY
-SCRIPT
+      prompt_file = ".vizier/prompts/DRAFT_PROMPTS.md"
     }
     produces = {
       succeeded = [{ custom = { type_id = "prompt_text", key = "draft_main" } }]
@@ -142,7 +60,7 @@ SCRIPT
     on = {
       succeeded = ["invoke_agent"]
     }
-    after = [{ node_id = "validate_provenance" }]
+    after = [{ node_id = "worktree_prepare" }]
   },
   {
     id = "invoke_agent"
@@ -178,33 +96,9 @@ SCRIPT
       ]
     }
     on = {
-      succeeded = ["rewrite_plan_state_provenance"]
-    }
-    after = [{ node_id = "invoke_agent" }]
-  },
-  {
-    id = "rewrite_plan_state_provenance"
-    name = "Draft / Rewrite Plan State"
-    kind = "shell"
-    uses = "cap.env.shell.command.run"
-    args = {
-      script = <<-SCRIPT
-set -euo pipefail
-
-slug="$${slug}"
-spec_file="$${spec_file}"
-spec_source="$${spec_source}"
-
-python3 .vizier/scripts/rewrite_plan_state.py \
-  --slug "$slug" \
-  --spec-file "$spec_file" \
-  --spec-source "$spec_source"
-SCRIPT
-    }
-    on = {
       succeeded = ["stage_files"]
     }
-    after = [{ node_id = "persist_plan" }]
+    after = [{ node_id = "invoke_agent" }]
   },
   {
     id = "stage_files"
@@ -220,7 +114,7 @@ SCRIPT
         { plan_doc = { slug = "$${slug}", branch = "$${branch}" } }
       ]
     }
-    after = [{ node_id = "rewrite_plan_state_provenance" }]
+    after = [{ node_id = "persist_plan" }]
     on = {
       succeeded = ["stage_commit"]
     }
