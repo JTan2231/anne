@@ -146,6 +146,73 @@ fn filter_quit_keeps_remaining_comments_unchanged() {
     assert!(stdout.contains("Filter status: quit"));
 }
 
+#[test]
+fn filter_specs_pages_generated_address_markdown_without_modifying_it() {
+    let repo = TestRepo::new("view-generated-specs");
+    init_repo(repo.path());
+
+    write_file(
+        &repo.path().join("src/lib.rs"),
+        "pub fn value() -> i32 {\n    1\n}\n",
+    );
+    commit_all(repo.path(), "initial");
+
+    create_and_checkout_branch(repo.path(), "feature");
+    write_file(
+        &repo.path().join("src/lib.rs"),
+        "pub fn value() -> i32 {\n    let value = 2;\n    value + 1\n}\n",
+    );
+    commit_all(repo.path(), "feature changes");
+
+    checkout_branch(repo.path(), "main");
+
+    let agent = agent_script(
+        repo.path(),
+        "prompt=$(cat)\ncase \"$prompt\" in\n  *\"You are writing one Anne feature spec to address a single review comment.\"*)\n    cat <<'EOF'\n# Anne\n\n## Feature: Spec viewer mode\n\n### Problem\n\nAnne should page through generated markdown specs.\n\n### Goals\n\n- Show the spec text from the newest address bundle.\n\n### Non-Goals\n\n- Mutating the generated spec files.\n\n## Proposed Approach\n\nTeach `anne filter specs` to page through the existing Markdown artifacts.\n\n## Execution Flow\n\n1. Run `anne address`.\n2. Run `anne filter specs`.\nEOF\n    ;;\n  *)\n    printf '[{\"path\":\"src/lib.rs\",\"side\":\"new\",\"line\":2,\"severity\":\"warning\",\"title\":\"Review finding\",\"body\":\"Generate a spec for this finding.\"}]\\n'\n    ;;\nesac\n",
+    );
+    write_agent_config(repo.path(), "text", &agent);
+
+    let review_output = anne(repo.path(), &["review", "main...feature"]);
+    assert!(
+        review_output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&review_output.stdout),
+        String::from_utf8_lossy(&review_output.stderr)
+    );
+
+    let address_output = anne(repo.path(), &["address", "R001"]);
+    assert!(
+        address_output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&address_output.stdout),
+        String::from_utf8_lossy(&address_output.stderr)
+    );
+
+    let bundle = address_bundle_path(repo.path(), &address_output.stdout);
+    let spec_path = bundle.join("specs/R001-Review-finding.md");
+    let before = fs::read_to_string(&spec_path).unwrap();
+
+    let filter_output = anne_with_stdin(repo.path(), &["filter", "specs"], "n");
+    assert!(
+        filter_output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&filter_output.stdout),
+        String::from_utf8_lossy(&filter_output.stderr)
+    );
+
+    let after = fs::read_to_string(&spec_path).unwrap();
+    assert_eq!(after, before);
+
+    let stdout = String::from_utf8_lossy(&filter_output.stdout);
+    assert!(stdout.contains("anne filter specs"));
+    assert!(stdout.contains("## Feature: Spec viewer mode"));
+    assert!(stdout.contains("Address bundle: .anne/address/"));
+    assert!(stdout.contains("Specs loaded: 1"));
+    assert!(stdout.contains("Specs viewed: 1"));
+    assert!(stdout.contains("Specs remaining: 0"));
+    assert!(stdout.contains("Filter status: completed"));
+}
+
 fn init_repo(path: &Path) {
     let mut options = RepositoryInitOptions::new();
     options.initial_head("main");
@@ -284,6 +351,15 @@ fn review_bundle_path(repo: &Path, stdout: &[u8]) -> PathBuf {
     let bundle = stdout
         .lines()
         .find_map(|line| line.strip_prefix("Review bundle: "))
+        .expect("missing bundle path in stdout");
+    repo.join(bundle)
+}
+
+fn address_bundle_path(repo: &Path, stdout: &[u8]) -> PathBuf {
+    let stdout = String::from_utf8_lossy(stdout);
+    let bundle = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("Address bundle: "))
         .expect("missing bundle path in stdout");
     repo.join(bundle)
 }

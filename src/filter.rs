@@ -4,7 +4,7 @@ use std::{
     process::{Command, Stdio},
 };
 
-use crate::{git, persisted_review};
+use crate::{cli::FilterTarget, git, persisted_address, persisted_review};
 
 const DEFAULT_TERMINAL_ROWS: usize = 24;
 const DEFAULT_TERMINAL_COLS: usize = 80;
@@ -20,22 +20,38 @@ const ANSI_PATCH_ADD: &str = "\x1b[32m";
 const ANSI_PATCH_DEL: &str = "\x1b[31m";
 const ANSI_PATCH_HUNK: &str = "\x1b[1;36m";
 
-pub struct RunResult {
-    pub bundle_path: String,
-    pub comments_loaded: usize,
-    pub comments_deleted: usize,
-    pub comments_remaining: usize,
-    pub completed: bool,
+pub enum RunResult {
+    Comments {
+        bundle_path: String,
+        comments_loaded: usize,
+        comments_deleted: usize,
+        comments_remaining: usize,
+        completed: bool,
+    },
+    Specs {
+        bundle_path: String,
+        specs_loaded: usize,
+        specs_viewed: usize,
+        specs_remaining: usize,
+        completed: bool,
+    },
 }
 
-pub fn run() -> Result<RunResult, String> {
+pub fn run(target: FilterTarget) -> Result<RunResult, String> {
+    match target {
+        FilterTarget::Comments => run_comments(),
+        FilterTarget::Specs => run_specs(),
+    }
+}
+
+fn run_comments() -> Result<RunResult, String> {
     let cwd = env::current_dir().map_err(|error| format!("failed to read current dir: {error}"))?;
     let repo_root = git::repo_root(&cwd)?;
     let mut review = persisted_review::discover_review_context(&repo_root)?;
 
     let comments_loaded = review.comments.len();
     if comments_loaded == 0 {
-        return Ok(RunResult {
+        return Ok(RunResult::Comments {
             bundle_path: review.bundle_path,
             comments_loaded,
             comments_deleted: 0,
@@ -87,31 +103,22 @@ pub fn run() -> Result<RunResult, String> {
                 rendered_plain = true;
             }
 
-            match read_action(&mut stdin)? {
+            match read_action(&mut stdin, true)? {
                 Action::Next => {
-                    if raw_mode.is_active() || stdout_is_terminal {
-                        writeln!(stdout)
-                            .map_err(|error| format!("failed writing newline: {error}"))?;
-                    }
+                    write_trailing_newline(&mut stdout, raw_mode.is_active() || stdout_is_terminal)?;
                     index += 1;
                     break;
                 }
                 Action::Delete => {
-                    if raw_mode.is_active() || stdout_is_terminal {
-                        writeln!(stdout)
-                            .map_err(|error| format!("failed writing newline: {error}"))?;
-                    }
+                    write_trailing_newline(&mut stdout, raw_mode.is_active() || stdout_is_terminal)?;
                     review.comments.remove(index);
                     review.persist_comments()?;
                     comments_deleted += 1;
                     break;
                 }
                 Action::Quit => {
-                    if raw_mode.is_active() || stdout_is_terminal {
-                        writeln!(stdout)
-                            .map_err(|error| format!("failed writing newline: {error}"))?;
-                    }
-                    return Ok(RunResult {
+                    write_trailing_newline(&mut stdout, raw_mode.is_active() || stdout_is_terminal)?;
+                    return Ok(RunResult::Comments {
                         bundle_path: review.bundle_path,
                         comments_loaded,
                         comments_deleted,
@@ -128,11 +135,96 @@ pub fn run() -> Result<RunResult, String> {
         }
     }
 
-    Ok(RunResult {
+    Ok(RunResult::Comments {
         bundle_path: review.bundle_path,
         comments_loaded,
         comments_deleted,
         comments_remaining: review.comments.len(),
+        completed: true,
+    })
+}
+
+fn run_specs() -> Result<RunResult, String> {
+    let cwd = env::current_dir().map_err(|error| format!("failed to read current dir: {error}"))?;
+    let repo_root = git::repo_root(&cwd)?;
+    let address = persisted_address::discover_address_context(&repo_root)?;
+
+    let specs_loaded = address.specs.len();
+    if specs_loaded == 0 {
+        return Ok(RunResult::Specs {
+            bundle_path: address.bundle_path,
+            specs_loaded,
+            specs_viewed: 0,
+            specs_remaining: 0,
+            completed: true,
+        });
+    }
+
+    let stdin_is_terminal = io::stdin().is_terminal();
+    let stdout_is_terminal = io::stdout().is_terminal();
+    let raw_mode = RawModeGuard::activate(stdin_is_terminal)?;
+    let mut stdin = io::stdin().lock();
+    let mut stdout = io::stdout().lock();
+    let mut specs_viewed = 0usize;
+    let mut index = 0usize;
+
+    while index < address.specs.len() {
+        let spec = address.specs[index].clone();
+        let spec_lines = text_lines(&spec.text);
+        let mut scroll = ScrollState::default();
+        let mut rendered_plain = false;
+        let mut viewport = ViewportMetrics::default();
+
+        loop {
+            if stdout_is_terminal {
+                viewport = render_terminal_spec(
+                    &mut stdout,
+                    &address,
+                    index,
+                    &spec,
+                    &spec_lines,
+                    &mut scroll,
+                    current_terminal_size(),
+                )
+                .map_err(|error| format!("failed writing filter interface: {error}"))?;
+            } else if !rendered_plain {
+                render_plain_spec(&mut stdout, &address, index, &spec, false)
+                    .map_err(|error| format!("failed writing filter interface: {error}"))?;
+                rendered_plain = true;
+            }
+
+            match read_action(&mut stdin, false)? {
+                Action::Next => {
+                    write_trailing_newline(&mut stdout, raw_mode.is_active() || stdout_is_terminal)?;
+                    specs_viewed += 1;
+                    index += 1;
+                    break;
+                }
+                Action::Delete => continue,
+                Action::Quit => {
+                    write_trailing_newline(&mut stdout, raw_mode.is_active() || stdout_is_terminal)?;
+                    return Ok(RunResult::Specs {
+                        bundle_path: address.bundle_path,
+                        specs_loaded,
+                        specs_viewed,
+                        specs_remaining: specs_loaded.saturating_sub(specs_viewed),
+                        completed: false,
+                    });
+                }
+                Action::Navigate(navigation) => {
+                    if stdout_is_terminal {
+                        scroll.apply(navigation, viewport);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(RunResult::Specs {
+        bundle_path: address.bundle_path,
+        specs_loaded,
+        specs_viewed,
+        specs_remaining: specs_loaded.saturating_sub(specs_viewed),
         completed: true,
     })
 }
@@ -211,15 +303,62 @@ fn render_plain_comment(
     stdout.flush()
 }
 
+fn render_plain_spec(
+    stdout: &mut impl Write,
+    address: &persisted_address::AddressContext,
+    index: usize,
+    spec: &persisted_address::GeneratedSpec,
+    clear_screen: bool,
+) -> io::Result<()> {
+    if clear_screen {
+        write!(stdout, "\x1b[2J\x1b[H")?;
+    }
+
+    writeln!(stdout, "anne filter specs")?;
+    writeln!(stdout)?;
+    writeln!(stdout, "Bundle: {}", address.bundle_path)?;
+    writeln!(stdout, "Spec: {}/{}", index + 1, address.specs.len())?;
+    writeln!(stdout, "Keys: n next, q quit")?;
+    writeln!(stdout)?;
+    writeln!(
+        stdout,
+        "{} {} {} {}",
+        spec.comment_id,
+        spec.severity,
+        spec.path,
+        spec.anchor()
+    )?;
+    writeln!(stdout, "{}", spec.title)?;
+    writeln!(stdout, "File: {}", spec.spec_file)?;
+    if let Some(review_id) = &address.source_review_id {
+        writeln!(stdout, "Source review: {review_id}")?;
+    }
+    if let Some(selection_filter) = &address.selection_filter {
+        writeln!(stdout, "Selection filter: {selection_filter}")?;
+    }
+    if let Some(status) = &address.status {
+        writeln!(stdout, "Bundle status: {status}")?;
+    }
+    if let Some(generated_at) = &address.generated_at {
+        writeln!(stdout, "Generated: {generated_at}")?;
+    }
+    writeln!(stdout)?;
+    writeln!(stdout, "{}", spec.text.trim_end())?;
+    write!(stdout, "Action [n/q]: ")?;
+    stdout.flush()
+}
+
+fn text_lines(text: &str) -> Vec<&str> {
+    let lines = text.lines().collect::<Vec<_>>();
+    if lines.is_empty() { vec![""] } else { lines }
+}
+
 fn patch_lines<'a>(
     comment: &'a persisted_review::SourceComment,
     patch_text: Option<&'a str>,
 ) -> Vec<&'a str> {
     match (comment.patch_file.as_deref(), patch_text) {
-        (Some(_), Some(text)) => {
-            let lines = text.lines().collect::<Vec<_>>();
-            if lines.is_empty() { vec![""] } else { lines }
-        }
+        (Some(_), Some(text)) => text_lines(text),
         _ => vec!["Patch context unavailable."],
     }
 }
@@ -298,6 +437,74 @@ fn render_terminal_comment(
     })
 }
 
+fn render_terminal_spec(
+    stdout: &mut impl Write,
+    address: &persisted_address::AddressContext,
+    index: usize,
+    spec: &persisted_address::GeneratedSpec,
+    spec_lines: &[&str],
+    scroll: &mut ScrollState,
+    size: TerminalSize,
+) -> io::Result<ViewportMetrics> {
+    let rows = size.rows.max(8);
+    let cols = size.cols.max(20);
+    let text_cols = cols.min(MAX_HEADER_COLS);
+    let header_lines = spec_terminal_header_lines(address, index, spec, text_cols);
+    let content_rows = rows.saturating_sub(header_lines.len() + 1).max(1);
+    let max_row_offset = spec_lines.len().saturating_sub(content_rows);
+    let max_col_offset = spec_lines
+        .iter()
+        .map(|line| line.chars().count())
+        .max()
+        .unwrap_or(0)
+        .saturating_sub(cols);
+
+    scroll.row_offset = scroll.row_offset.min(max_row_offset);
+    scroll.col_offset = scroll.col_offset.min(max_col_offset);
+
+    let first_line = scroll.row_offset + 1;
+    let last_line = (scroll.row_offset + content_rows).min(spec_lines.len());
+    let spec_status = truncate_line(
+        &format!(
+            "Spec: {}  {} lines  View {first_line}-{last_line}/{}  Col {}",
+            spec.spec_file,
+            spec_lines.len(),
+            spec_lines.len(),
+            scroll.col_offset + 1
+        ),
+        text_cols,
+    );
+
+    write!(stdout, "\x1b[2J\x1b[H")?;
+    for (line_index, line) in header_lines.iter().enumerate() {
+        writeln!(
+            stdout,
+            "{}",
+            render_header_line(line, line_index, spec.severity.as_str())
+        )?;
+    }
+    writeln!(stdout, "{}", paint(&spec_status, ANSI_DIM))?;
+
+    let visible_lines = spec_lines
+        .iter()
+        .skip(scroll.row_offset)
+        .take(content_rows)
+        .collect::<Vec<_>>();
+    for line in &visible_lines {
+        writeln!(stdout, "{}", render_spec_line(line, scroll.col_offset, cols))?;
+    }
+    for _ in visible_lines.len()..content_rows {
+        writeln!(stdout)?;
+    }
+
+    stdout.flush()?;
+    Ok(ViewportMetrics {
+        content_rows,
+        max_row_offset,
+        max_col_offset,
+    })
+}
+
 fn terminal_header_lines(
     bundle_path: &str,
     index: usize,
@@ -324,6 +531,37 @@ fn terminal_header_lines(
             cols,
         ),
     ]
+}
+
+fn spec_terminal_header_lines(
+    address: &persisted_address::AddressContext,
+    index: usize,
+    spec: &persisted_address::GeneratedSpec,
+    cols: usize,
+) -> Vec<String> {
+    let mut lines = vec![
+        truncate_line("anne filter specs", cols),
+        truncate_line(&format!("Bundle: {}", address.bundle_path), cols),
+        truncate_line(&format!("Spec: {}/{}", index + 1, address.specs.len()), cols),
+        truncate_line("Keys: arrows scroll, PgUp/PgDn page, n next, q quit", cols),
+        truncate_line(
+            &format!(
+                "{} {} {} {}",
+                spec.comment_id,
+                spec.severity,
+                spec.path,
+                spec.anchor()
+            ),
+            cols,
+        ),
+        truncate_line(&format!("File: {}", spec.spec_file), cols),
+    ];
+
+    if let Some(review_id) = &address.source_review_id {
+        lines.push(truncate_line(&format!("Source review: {review_id}"), cols));
+    }
+
+    lines
 }
 
 fn terminal_content_lines<'a>(
@@ -398,6 +636,11 @@ fn render_patch_line(text: &str, col_offset: usize, width: usize) -> String {
     paint(&visible, patch_line_style(text))
 }
 
+fn render_spec_line(text: &str, col_offset: usize, width: usize) -> String {
+    let visible = visible_slice(text, col_offset, width);
+    paint(&visible, spec_line_style(text))
+}
+
 fn severity_style(severity: &str) -> &'static str {
     match severity {
         "error" => ANSI_ERROR,
@@ -433,6 +676,21 @@ fn patch_line_style(text: &str) -> &'static str {
     } else {
         ""
     }
+}
+
+fn spec_line_style(text: &str) -> &'static str {
+    if text.starts_with('#') {
+        ANSI_ACCENT
+    } else {
+        ""
+    }
+}
+
+fn write_trailing_newline(stdout: &mut impl Write, enabled: bool) -> Result<(), String> {
+    if enabled {
+        writeln!(stdout).map_err(|error| format!("failed writing newline: {error}"))?;
+    }
+    Ok(())
 }
 
 fn paint(text: &str, style: &str) -> String {
@@ -605,11 +863,11 @@ fn current_terminal_size() -> TerminalSize {
     TerminalSize { rows, cols }
 }
 
-fn read_action(stdin: &mut impl Read) -> Result<Action, String> {
+fn read_action(stdin: &mut impl Read, allow_delete: bool) -> Result<Action, String> {
     loop {
         match read_byte(stdin)? {
             b'n' | b'N' => return Ok(Action::Next),
-            b'd' | b'D' => return Ok(Action::Delete),
+            b'd' | b'D' if allow_delete => return Ok(Action::Delete),
             b'q' | b'Q' | 3 => return Ok(Action::Quit),
             b'\x1b' => {
                 if let Some(navigation) = read_escape_sequence(stdin)? {
@@ -831,30 +1089,37 @@ mod tests {
         let mut input = Cursor::new(b"\x1b[A\x1b[B\x1b[C\x1b[D\x1b[5~\x1b[6~n");
 
         assert_eq!(
-            read_action(&mut input).unwrap(),
+            read_action(&mut input, true).unwrap(),
             Action::Navigate(Navigation::Up)
         );
         assert_eq!(
-            read_action(&mut input).unwrap(),
+            read_action(&mut input, true).unwrap(),
             Action::Navigate(Navigation::Down)
         );
         assert_eq!(
-            read_action(&mut input).unwrap(),
+            read_action(&mut input, true).unwrap(),
             Action::Navigate(Navigation::Right)
         );
         assert_eq!(
-            read_action(&mut input).unwrap(),
+            read_action(&mut input, true).unwrap(),
             Action::Navigate(Navigation::Left)
         );
         assert_eq!(
-            read_action(&mut input).unwrap(),
+            read_action(&mut input, true).unwrap(),
             Action::Navigate(Navigation::PageUp)
         );
         assert_eq!(
-            read_action(&mut input).unwrap(),
+            read_action(&mut input, true).unwrap(),
             Action::Navigate(Navigation::PageDown)
         );
-        assert_eq!(read_action(&mut input).unwrap(), Action::Next);
+        assert_eq!(read_action(&mut input, true).unwrap(), Action::Next);
+    }
+
+    #[test]
+    fn read_action_ignores_delete_when_disabled() {
+        let mut input = Cursor::new(b"dq");
+
+        assert_eq!(read_action(&mut input, false).unwrap(), Action::Quit);
     }
 
     #[test]

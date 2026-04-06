@@ -6,7 +6,7 @@ Anne is a local, agent-driven review tool for Git repositories. It reviews a `<b
 
 - `anne review <base>...<head>` reviews the diff from the merge base to `<head>` and writes a review bundle.
 - `anne address [<comment-id>]` generates one spec per selected review comment from the newest usable review bundle.
-- `anne filter` pages through the current persisted review comments and lets you delete them in place.
+- `anne filter [comments|specs]` pages through persisted review comments or generated address specs. `comments` is the default.
 
 Run `anne --help` or `anne <command> --help` for the built-in command help.
 
@@ -75,6 +75,12 @@ anne address
 anne address R003
 ```
 
+5. Optionally page through the generated Markdown specs:
+
+```bash
+anne filter specs
+```
+
 If you are running from a source checkout instead of an installed binary, use `cargo run --`:
 
 ```bash
@@ -111,6 +117,12 @@ Generate a spec for a single finding:
 
 ```bash
 anne address R001
+```
+
+Page through the generated Markdown specs:
+
+```bash
+anne filter specs
 ```
 
 ## Configuration
@@ -188,19 +200,21 @@ Return `[]` when there are no findings.
 
 ### `anne filter`
 
-- `anne filter` operates on the newest usable review bundle under `.anne/reviews/`.
+- `anne filter` and `anne filter comments` operate on the newest usable review bundle under `.anne/reviews/`.
+- `anne filter specs` operates on the newest usable address bundle under `.anne/address/`.
 - Completed bundles are preferred over running bundles.
-- In a terminal, Anne shows a scrollable patch view. If stdout is not a terminal, it falls back to a plain prompt flow.
-- Every delete rewrites `comments.json`, `comments.md`, and manifest counts immediately.
+- In a terminal, Anne shows a scrollable content view. If stdout is not a terminal, it falls back to a plain prompt flow.
+- In `comments` mode, every delete rewrites `comments.json`, `comments.md`, and manifest counts immediately.
+- In `specs` mode, filtering is read-only and pages through the generated Markdown spec files.
 
 Keys:
 
 - `Up` / `Down`: scroll one line
 - `Left` / `Right`: scroll horizontally
 - `PgUp` / `PgDn`: scroll by one page
-- `n`: keep the current comment and move on
-- `d`: delete the current comment from the selected bundle
-- `q`: quit immediately and keep the remaining comments unchanged
+- `n`: move to the next item
+- `d`: delete the current comment from the selected bundle in `comments` mode
+- `q`: quit immediately
 
 ### `anne address`
 
@@ -260,4 +274,3 @@ The JSON outputs are meant to be machine-readable:
 
 - `ANNE_AGENT_SHIMS_DIR` can point Anne at a custom bundled-shim root.
 - `NO_COLOR` and `ANNE_NO_ANSI` disable ANSI color in the bundled default progress filter.
-

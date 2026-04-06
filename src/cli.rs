@@ -9,12 +9,23 @@ pub struct AddressRequest {
     pub comment_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterTarget {
+    Comments,
+    Specs,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilterRequest {
+    pub target: FilterTarget,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     Help(String),
     Review(ReviewRequest),
     Address(AddressRequest),
-    Filter,
+    Filter(FilterRequest),
 }
 
 pub fn parse(args: &[String]) -> Result<Command, String> {
@@ -137,8 +148,12 @@ fn parse_address(args: &[String]) -> Result<Command, String> {
 
 fn parse_filter(args: &[String]) -> Result<Command, String> {
     if args.is_empty() {
-        return Ok(Command::Filter);
+        return Ok(Command::Filter(FilterRequest {
+            target: FilterTarget::Comments,
+        }));
     }
+
+    let mut target = None;
 
     for arg in args {
         match arg.as_str() {
@@ -146,18 +161,36 @@ fn parse_filter(args: &[String]) -> Result<Command, String> {
             value if value.starts_with("--") => {
                 return Err(format!("unknown flag `{value}`"));
             }
-            _ => {
-                return Err("filter does not accept positional arguments".to_string());
+            "comments" => {
+                if target.replace(FilterTarget::Comments).is_some() {
+                    return Err(
+                        "filter accepts at most one positional <comments|specs>".to_string(),
+                    );
+                }
+            }
+            "specs" => {
+                if target.replace(FilterTarget::Specs).is_some() {
+                    return Err(
+                        "filter accepts at most one positional <comments|specs>".to_string(),
+                    );
+                }
+            }
+            value => {
+                return Err(format!(
+                    "unknown filter target `{value}`; expected `comments` or `specs`"
+                ));
             }
         }
     }
 
-    Ok(Command::Filter)
+    Ok(Command::Filter(FilterRequest {
+        target: target.unwrap_or(FilterTarget::Comments),
+    }))
 }
 
 fn root_help() -> String {
     format!(
-        "{binary}\n\nCommands:\n  review    Review <base>...<head> using merge-base semantics\n  address   Generate feature specs from the latest persisted review findings\n  filter    Page through persisted review comments and optionally delete them\n\nRun `{binary} review --help`, `{binary} address --help`, or `{binary} filter --help` for details.",
+        "{binary}\n\nCommands:\n  review    Review <base>...<head> using merge-base semantics\n  address   Generate feature specs from the latest persisted review findings\n  filter    Page through persisted review comments or generated address specs\n\nRun `{binary} review --help`, `{binary} address --help`, or `{binary} filter --help` for details.",
         binary = "anne"
     )
 }
@@ -200,22 +233,26 @@ fn filter_help() -> String {
     "\
 anne filter
 
-Page through the current persisted review comments and optionally delete individual comments in place.
+Page through persisted review comments or generated address specs.
 
 Usage:
   anne filter
+  anne filter comments
+  anne filter specs
 
 Keys:
-  Up/Down      scroll the visible patch one line
-  Left/Right   scroll the visible patch horizontally
-  PgUp/PgDn    scroll the visible patch by one page
-  n   keep the current comment and move to the next one
-  d   delete the current comment from the selected review bundle
-  q   quit immediately and keep the remaining comments unchanged
+  Up/Down      scroll the visible content one line
+  Left/Right   scroll the visible content horizontally
+  PgUp/PgDn    scroll the visible content by one page
+  n   move to the next item
+  d   delete the current comment from the selected review bundle (`comments` mode only)
+  q   quit immediately
 
 Notes:
-  - Anne discovers review bundles at runtime under `.anne/reviews/`.
-  - Anne selects the newest usable persisted review bundle, preferring completed bundles over running ones.
-  - Each delete rewrites the selected bundle's `comments.json`, `comments.md`, and manifest counts immediately."
+  - `anne filter` and `anne filter comments` discover the newest usable review bundle under `.anne/reviews/`.
+  - `anne filter specs` discovers the newest usable address bundle under `.anne/address/`.
+  - Anne prefers completed bundles over running bundles.
+  - In `comments` mode, each delete rewrites the selected bundle's `comments.json`, `comments.md`, and manifest counts immediately.
+  - In `specs` mode, filtering is read-only and pages through generated Markdown spec files."
         .to_string()
 }

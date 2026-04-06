@@ -5,6 +5,7 @@ mod config;
 mod filter;
 mod git;
 mod json;
+mod persisted_address;
 mod persisted_review;
 mod review;
 mod util;
@@ -67,19 +68,38 @@ pub fn run_from_env() -> ExitCode {
                 ExitCode::from(1)
             }
         },
-        Ok(cli::Command::Filter) => match filter::run() {
-            Ok(result) => {
-                println!("Review bundle: {}", result.bundle_path);
-                println!("Comments loaded: {}", result.comments_loaded);
-                println!("Comments deleted: {}", result.comments_deleted);
-                println!("Comments remaining: {}", result.comments_remaining);
+        Ok(cli::Command::Filter(request)) => match filter::run(request.target) {
+            Ok(filter::RunResult::Comments {
+                bundle_path,
+                comments_loaded,
+                comments_deleted,
+                comments_remaining,
+                completed,
+            }) => {
+                println!("Review bundle: {bundle_path}");
+                println!("Comments loaded: {comments_loaded}");
+                println!("Comments deleted: {comments_deleted}");
+                println!("Comments remaining: {comments_remaining}");
                 println!(
                     "Filter status: {}",
-                    if result.completed {
-                        "completed"
-                    } else {
-                        "quit"
-                    }
+                    if completed { "completed" } else { "quit" }
+                );
+                ExitCode::SUCCESS
+            }
+            Ok(filter::RunResult::Specs {
+                bundle_path,
+                specs_loaded,
+                specs_viewed,
+                specs_remaining,
+                completed,
+            }) => {
+                println!("Address bundle: {bundle_path}");
+                println!("Specs loaded: {specs_loaded}");
+                println!("Specs viewed: {specs_viewed}");
+                println!("Specs remaining: {specs_remaining}");
+                println!(
+                    "Filter status: {}",
+                    if completed { "completed" } else { "quit" }
                 );
                 ExitCode::SUCCESS
             }
@@ -97,7 +117,7 @@ pub fn run_from_env() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use crate::cli::{self, AddressRequest, Command, ReviewRequest};
+    use crate::cli::{self, AddressRequest, Command, FilterRequest, FilterTarget, ReviewRequest};
 
     #[test]
     fn parses_explicit_review_refs() {
@@ -185,12 +205,28 @@ mod tests {
     #[test]
     fn parses_filter_without_args() {
         let command = cli::parse(&["filter".to_string()]).unwrap();
-        assert_eq!(command, Command::Filter);
+        assert_eq!(
+            command,
+            Command::Filter(FilterRequest {
+                target: FilterTarget::Comments
+            })
+        );
     }
 
     #[test]
-    fn rejects_filter_positional_args() {
+    fn parses_filter_specs_target() {
+        let command = cli::parse(&["filter".to_string(), "specs".to_string()]).unwrap();
+        assert_eq!(
+            command,
+            Command::Filter(FilterRequest {
+                target: FilterTarget::Specs
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_filter_target() {
         let error = cli::parse(&["filter".to_string(), "R001".to_string()]).unwrap_err();
-        assert!(error.contains("does not accept positional arguments"));
+        assert!(error.contains("unknown filter target"));
     }
 }
