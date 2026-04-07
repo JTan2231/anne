@@ -52,6 +52,34 @@ Other install helpers:
 - bundled agent shims under `$PREFIX/share/anne/agents`
 - an install manifest at `$PREFIX/share/anne/install-manifest.txt`
 
+## Library API
+
+Anne now exposes its reusable runtime as a library. The CLI is a thin layer over the same core modules.
+
+Use the stateful handle when you want to resolve repo/config once and issue multiple operations:
+
+```rust
+use anne::{AddressRequest, Anne, ReviewRequest};
+
+let anne = Anne::discover()?;
+
+let review = anne.review(ReviewRequest {
+    base: "origin/main".to_string(),
+    head: "HEAD".to_string(),
+})?;
+
+let address = anne.address(AddressRequest { comment_id: None })?;
+```
+
+Each core module also exposes direct entrypoints:
+
+- `review::run(...)`: discover the current repo and load config automatically
+- `review::run_in(repo_root, ...)`: run against an explicit repo root
+- `review::run_with(repo_root, config, ...)`: run with an explicit repo root and config
+- `address` and `investigate` expose the same `run` / `run_in` / `run_with` pattern
+
+`filter` remains CLI/TUI-oriented because it owns terminal interaction.
+
 ## Quick Start
 
 1. Run a review against the branch or commit range you care about:

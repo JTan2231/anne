@@ -1,24 +1,7 @@
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReviewRequest {
-    pub base: String,
-    pub head: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AddressRequest {
-    pub comment_id: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InvestigationRequest {
-    pub prompt: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FilterTarget {
-    Comments,
-    Specs,
-}
+use crate::{
+    address::AddressRequest, filter::FilterTarget, investigate::InvestigationRequest,
+    review::ReviewRequest,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FilterRequest {

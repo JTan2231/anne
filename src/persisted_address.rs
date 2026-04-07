@@ -265,7 +265,10 @@ fn no_usable_address_bundle_error(skipped: &[SkippedAddressCandidate]) -> String
         if index > 0 {
             error.push_str("; ");
         }
-        error.push_str(&format!("`{}` ({})", candidate.address_id, candidate.reason));
+        error.push_str(&format!(
+            "`{}` ({})",
+            candidate.address_id, candidate.reason
+        ));
     }
     error
 }

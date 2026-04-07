@@ -7,12 +7,16 @@ use std::{
 
 use crate::{
     agent,
-    cli::InvestigationRequest,
     config::{AgentConfig, AppConfig},
     git::{self, RepoContext},
     json::JsonValue,
     util::{current_timestamp, slugify_text, string_array},
 };
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvestigationRequest {
+    pub prompt: String,
+}
 
 pub struct RunResult {
     pub bundle_path: Option<String>,
@@ -21,7 +25,22 @@ pub struct RunResult {
 }
 
 pub fn run(request: InvestigationRequest) -> Result<RunResult, String> {
-    let prepared = prepare_run(&request.prompt)?;
+    let cwd = env::current_dir().map_err(|error| format!("failed to read current dir: {error}"))?;
+    let repo_root = git::repo_root(&cwd)?;
+    run_in(&repo_root, request)
+}
+
+pub fn run_in(repo_root: &Path, request: InvestigationRequest) -> Result<RunResult, String> {
+    let config = AppConfig::load(repo_root)?;
+    run_with(repo_root, &config, request)
+}
+
+pub fn run_with(
+    repo_root: &Path,
+    config: &AppConfig,
+    request: InvestigationRequest,
+) -> Result<RunResult, String> {
+    let prepared = prepare_run(repo_root, config, &request.prompt)?;
     Ok(run_reserved(prepared))
 }
 
@@ -39,16 +58,13 @@ struct ReservedInvestigationBundle {
     bundle_root: PathBuf,
 }
 
-fn prepare_run(prompt: &str) -> Result<PreparedRun, String> {
-    let cwd = env::current_dir().map_err(|error| format!("failed to read current dir: {error}"))?;
-    let repo_root = git::repo_root(&cwd)?;
-    let config = AppConfig::load(&repo_root)?;
+fn prepare_run(repo_root: &Path, config: &AppConfig, prompt: &str) -> Result<PreparedRun, String> {
     let generated_at = current_timestamp();
-    let bundle = reserve_investigation_bundle(&repo_root, &generated_at, prompt)?;
+    let bundle = reserve_investigation_bundle(repo_root, &generated_at, prompt)?;
 
     Ok(PreparedRun {
-        repo_root,
-        config,
+        repo_root: repo_root.to_path_buf(),
+        config: config.clone(),
         prompt: prompt.to_string(),
         generated_at,
         bundle,

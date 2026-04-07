@@ -14,6 +14,11 @@ use crate::{
     util::{current_timestamp, is_canonical_timestamp, slugify_text, string_array},
 };
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddressRequest {
+    pub comment_id: Option<String>,
+}
+
 pub struct RunResult {
     pub bundle_path: Option<String>,
     pub comments_selected: usize,
@@ -23,8 +28,23 @@ pub struct RunResult {
     pub error: Option<String>,
 }
 
-pub fn run(comment_id: Option<String>) -> Result<RunResult, String> {
-    let prepared = prepare_run(comment_id)?;
+pub fn run(request: AddressRequest) -> Result<RunResult, String> {
+    let cwd = env::current_dir().map_err(|error| format!("failed to read current dir: {error}"))?;
+    let repo_root = git::repo_root(&cwd)?;
+    run_in(&repo_root, request)
+}
+
+pub fn run_in(repo_root: &Path, request: AddressRequest) -> Result<RunResult, String> {
+    let config = AppConfig::load(repo_root)?;
+    run_with(repo_root, &config, request)
+}
+
+pub fn run_with(
+    repo_root: &Path,
+    config: &AppConfig,
+    request: AddressRequest,
+) -> Result<RunResult, String> {
+    let prepared = prepare_run(repo_root, config, request.comment_id)?;
     Ok(run_reserved(prepared))
 }
 
@@ -45,11 +65,12 @@ struct ReservedAddressBundle {
     bundle_root: PathBuf,
 }
 
-fn prepare_run(comment_id: Option<String>) -> Result<PreparedRun, String> {
-    let cwd = env::current_dir().map_err(|error| format!("failed to read current dir: {error}"))?;
-    let repo_root = git::repo_root(&cwd)?;
-    let config = AppConfig::load(&repo_root)?;
-    let review_context = discover_review_context(&repo_root)?;
+fn prepare_run(
+    repo_root: &Path,
+    config: &AppConfig,
+    comment_id: Option<String>,
+) -> Result<PreparedRun, String> {
+    let review_context = discover_review_context(repo_root)?;
 
     let mut selected_comments = review_context.comments.clone();
     selected_comments.sort_by(|left, right| left.id.cmp(&right.id));
@@ -78,11 +99,11 @@ fn prepare_run(comment_id: Option<String>) -> Result<PreparedRun, String> {
     }
 
     let generated_at = current_timestamp();
-    let bundle = reserve_address_bundle(&repo_root, &generated_at, &selection_filter)?;
+    let bundle = reserve_address_bundle(repo_root, &generated_at, &selection_filter)?;
 
     Ok(PreparedRun {
-        repo_root,
-        config,
+        repo_root: repo_root.to_path_buf(),
+        config: config.clone(),
         review_context,
         selected_comments,
         spec_structure,
@@ -1163,7 +1184,9 @@ impl SpecStructure {
             text.push_str("- Core feature heading pattern: ## Feature: <short feature name>\n");
         }
         if self.feature_subsections.is_empty() {
-            text.push_str("- The standard Anne spec shape does not define feature subsections explicitly.\n");
+            text.push_str(
+                "- The standard Anne spec shape does not define feature subsections explicitly.\n",
+            );
         } else {
             text.push_str("- Feature subsections in Anne spec order:\n");
             for subsection in &self.feature_subsections {
@@ -1171,7 +1194,9 @@ impl SpecStructure {
             }
         }
         if self.other_sections.is_empty() {
-            text.push_str("- No additional top-level sections are part of the standard Anne spec shape.\n");
+            text.push_str(
+                "- No additional top-level sections are part of the standard Anne spec shape.\n",
+            );
         } else {
             text.push_str("- Additional top-level sections in Anne spec order:\n");
             for section in &self.other_sections {

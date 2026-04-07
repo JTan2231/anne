@@ -4,7 +4,7 @@ use std::{
     process::{Command, Stdio},
 };
 
-use crate::{cli::FilterTarget, git, persisted_address, persisted_review};
+use crate::{git, persisted_address, persisted_review};
 
 const DEFAULT_TERMINAL_ROWS: usize = 24;
 const DEFAULT_TERMINAL_COLS: usize = 80;
@@ -19,6 +19,12 @@ const ANSI_PATCH_META: &str = "\x1b[34m";
 const ANSI_PATCH_ADD: &str = "\x1b[32m";
 const ANSI_PATCH_DEL: &str = "\x1b[31m";
 const ANSI_PATCH_HUNK: &str = "\x1b[1;36m";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterTarget {
+    Comments,
+    Specs,
+}
 
 pub enum RunResult {
     Comments {
@@ -38,16 +44,20 @@ pub enum RunResult {
 }
 
 pub fn run(target: FilterTarget) -> Result<RunResult, String> {
+    let cwd = env::current_dir().map_err(|error| format!("failed to read current dir: {error}"))?;
+    let repo_root = git::repo_root(&cwd)?;
+    run_in(&repo_root, target)
+}
+
+pub fn run_in(repo_root: &std::path::Path, target: FilterTarget) -> Result<RunResult, String> {
     match target {
-        FilterTarget::Comments => run_comments(),
-        FilterTarget::Specs => run_specs(),
+        FilterTarget::Comments => run_comments(repo_root),
+        FilterTarget::Specs => run_specs(repo_root),
     }
 }
 
-fn run_comments() -> Result<RunResult, String> {
-    let cwd = env::current_dir().map_err(|error| format!("failed to read current dir: {error}"))?;
-    let repo_root = git::repo_root(&cwd)?;
-    let mut review = persisted_review::discover_review_context(&repo_root)?;
+fn run_comments(repo_root: &std::path::Path) -> Result<RunResult, String> {
+    let mut review = persisted_review::discover_review_context(repo_root)?;
 
     let comments_loaded = review.comments.len();
     if comments_loaded == 0 {
@@ -105,19 +115,28 @@ fn run_comments() -> Result<RunResult, String> {
 
             match read_action(&mut stdin, true)? {
                 Action::Next => {
-                    write_trailing_newline(&mut stdout, raw_mode.is_active() || stdout_is_terminal)?;
+                    write_trailing_newline(
+                        &mut stdout,
+                        raw_mode.is_active() || stdout_is_terminal,
+                    )?;
                     index += 1;
                     break;
                 }
                 Action::Delete => {
-                    write_trailing_newline(&mut stdout, raw_mode.is_active() || stdout_is_terminal)?;
+                    write_trailing_newline(
+                        &mut stdout,
+                        raw_mode.is_active() || stdout_is_terminal,
+                    )?;
                     review.comments.remove(index);
                     review.persist_comments()?;
                     comments_deleted += 1;
                     break;
                 }
                 Action::Quit => {
-                    write_trailing_newline(&mut stdout, raw_mode.is_active() || stdout_is_terminal)?;
+                    write_trailing_newline(
+                        &mut stdout,
+                        raw_mode.is_active() || stdout_is_terminal,
+                    )?;
                     return Ok(RunResult::Comments {
                         bundle_path: review.bundle_path,
                         comments_loaded,
@@ -144,10 +163,8 @@ fn run_comments() -> Result<RunResult, String> {
     })
 }
 
-fn run_specs() -> Result<RunResult, String> {
-    let cwd = env::current_dir().map_err(|error| format!("failed to read current dir: {error}"))?;
-    let repo_root = git::repo_root(&cwd)?;
-    let address = persisted_address::discover_address_context(&repo_root)?;
+fn run_specs(repo_root: &std::path::Path) -> Result<RunResult, String> {
+    let address = persisted_address::discover_address_context(repo_root)?;
 
     let specs_loaded = address.specs.len();
     if specs_loaded == 0 {
@@ -195,14 +212,20 @@ fn run_specs() -> Result<RunResult, String> {
 
             match read_action(&mut stdin, false)? {
                 Action::Next => {
-                    write_trailing_newline(&mut stdout, raw_mode.is_active() || stdout_is_terminal)?;
+                    write_trailing_newline(
+                        &mut stdout,
+                        raw_mode.is_active() || stdout_is_terminal,
+                    )?;
                     specs_viewed += 1;
                     index += 1;
                     break;
                 }
                 Action::Delete => continue,
                 Action::Quit => {
-                    write_trailing_newline(&mut stdout, raw_mode.is_active() || stdout_is_terminal)?;
+                    write_trailing_newline(
+                        &mut stdout,
+                        raw_mode.is_active() || stdout_is_terminal,
+                    )?;
                     return Ok(RunResult::Specs {
                         bundle_path: address.bundle_path,
                         specs_loaded,
@@ -491,7 +514,11 @@ fn render_terminal_spec(
         .take(content_rows)
         .collect::<Vec<_>>();
     for line in &visible_lines {
-        writeln!(stdout, "{}", render_spec_line(line, scroll.col_offset, cols))?;
+        writeln!(
+            stdout,
+            "{}",
+            render_spec_line(line, scroll.col_offset, cols)
+        )?;
     }
     for _ in visible_lines.len()..content_rows {
         writeln!(stdout)?;
@@ -542,7 +569,10 @@ fn spec_terminal_header_lines(
     let mut lines = vec![
         truncate_line("anne filter specs", cols),
         truncate_line(&format!("Bundle: {}", address.bundle_path), cols),
-        truncate_line(&format!("Spec: {}/{}", index + 1, address.specs.len()), cols),
+        truncate_line(
+            &format!("Spec: {}/{}", index + 1, address.specs.len()),
+            cols,
+        ),
         truncate_line("Keys: arrows scroll, PgUp/PgDn page, n next, q quit", cols),
         truncate_line(
             &format!(

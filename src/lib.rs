@@ -1,97 +1,167 @@
-mod address;
+pub mod address;
 mod agent;
 mod cli;
-mod config;
+pub mod config;
 mod filter;
-mod git;
-mod investigate;
+pub mod git;
+pub mod investigate;
 mod json;
 mod persisted_address;
 mod persisted_review;
-mod review;
+pub mod review;
 mod util;
 
-use std::{env, process::ExitCode};
+pub use address::AddressRequest;
+pub use config::AppConfig;
+pub use investigate::InvestigationRequest;
+pub use review::ReviewRequest;
+
+use std::{
+    env,
+    path::{Path, PathBuf},
+    process::ExitCode,
+};
+
+#[derive(Debug, Clone)]
+pub struct Anne {
+    repo_root: PathBuf,
+    config: AppConfig,
+}
+
+impl Anne {
+    pub fn discover() -> Result<Self, String> {
+        let cwd =
+            env::current_dir().map_err(|error| format!("failed to read current dir: {error}"))?;
+        Self::discover_from(&cwd)
+    }
+
+    pub fn discover_from(cwd: &Path) -> Result<Self, String> {
+        let repo_root = git::repo_root(cwd)?;
+        Self::open(&repo_root)
+    }
+
+    pub fn open(repo_root: &Path) -> Result<Self, String> {
+        let config = AppConfig::load(repo_root)?;
+        Ok(Self::from_parts(repo_root.to_path_buf(), config))
+    }
+
+    pub fn from_parts(repo_root: PathBuf, config: AppConfig) -> Self {
+        Self { repo_root, config }
+    }
+
+    pub fn repo_root(&self) -> &Path {
+        &self.repo_root
+    }
+
+    pub fn config(&self) -> &AppConfig {
+        &self.config
+    }
+
+    pub fn review(&self, request: review::ReviewRequest) -> Result<review::RunResult, String> {
+        review::run_with(&self.repo_root, &self.config, request)
+    }
+
+    pub fn investigate(
+        &self,
+        request: investigate::InvestigationRequest,
+    ) -> Result<investigate::RunResult, String> {
+        investigate::run_with(&self.repo_root, &self.config, request)
+    }
+
+    pub fn address(&self, request: address::AddressRequest) -> Result<address::RunResult, String> {
+        address::run_with(&self.repo_root, &self.config, request)
+    }
+}
 
 pub fn run_from_env() -> ExitCode {
     let args = env::args().skip(1).collect::<Vec<_>>();
+    run_cli(&args)
+}
+
+pub fn run_cli(args: &[String]) -> ExitCode {
     match cli::parse(&args) {
         Ok(cli::Command::Help(text)) => {
             println!("{text}");
             ExitCode::SUCCESS
         }
-        Ok(cli::Command::Review(request)) => match review::run(request) {
-            Ok(result) => {
-                if let Some(bundle_path) = &result.bundle_path {
-                    println!("Review bundle: {bundle_path}");
-                    println!("Files reviewed: {}", result.files_reviewed);
-                    println!("Files skipped: {}", result.files_skipped);
-                    if result.files_failed > 0 {
-                        println!("Files failed: {}", result.files_failed);
+        Ok(cli::Command::Review(request)) => {
+            match Anne::discover().and_then(|anne| anne.review(request)) {
+                Ok(result) => {
+                    if let Some(bundle_path) = &result.bundle_path {
+                        println!("Review bundle: {bundle_path}");
+                        println!("Files reviewed: {}", result.files_reviewed);
+                        println!("Files skipped: {}", result.files_skipped);
+                        if result.files_failed > 0 {
+                            println!("Files failed: {}", result.files_failed);
+                        }
+                        println!("Findings: {}", result.findings);
                     }
-                    println!("Findings: {}", result.findings);
-                }
 
-                if result.success {
-                    ExitCode::SUCCESS
-                } else {
-                    if let Some(error) = &result.error {
-                        eprintln!("error: {error}");
-                    }
-                    ExitCode::from(1)
-                }
-            }
-            Err(error) => {
-                eprintln!("error: {error}");
-                ExitCode::from(1)
-            }
-        },
-        Ok(cli::Command::Investigate(request)) => match investigate::run(request) {
-            Ok(result) => {
-                if let Some(bundle_path) = &result.bundle_path {
-                    println!("Investigation bundle: {bundle_path}");
                     if result.success {
-                        println!("Report: report.md");
+                        ExitCode::SUCCESS
+                    } else {
+                        if let Some(error) = &result.error {
+                            eprintln!("error: {error}");
+                        }
+                        ExitCode::from(1)
                     }
                 }
-
-                if result.success {
-                    ExitCode::SUCCESS
-                } else {
-                    if let Some(error) = &result.error {
-                        eprintln!("error: {error}");
-                    }
+                Err(error) => {
+                    eprintln!("error: {error}");
                     ExitCode::from(1)
                 }
             }
-            Err(error) => {
-                eprintln!("error: {error}");
-                ExitCode::from(1)
-            }
-        },
-        Ok(cli::Command::Address(request)) => match address::run(request.comment_id) {
-            Ok(result) => {
-                if let Some(bundle_path) = &result.bundle_path {
-                    println!("Address bundle: {bundle_path}");
-                    println!("Comments selected: {}", result.comments_selected);
-                    println!("Specs generated: {}", result.specs_generated);
-                    println!("Specs failed: {}", result.specs_failed);
-                }
-
-                if result.success {
-                    ExitCode::SUCCESS
-                } else {
-                    if let Some(error) = &result.error {
-                        eprintln!("error: {error}");
+        }
+        Ok(cli::Command::Investigate(request)) => {
+            match Anne::discover().and_then(|anne| anne.investigate(request)) {
+                Ok(result) => {
+                    if let Some(bundle_path) = &result.bundle_path {
+                        println!("Investigation bundle: {bundle_path}");
+                        if result.success {
+                            println!("Report: report.md");
+                        }
                     }
+
+                    if result.success {
+                        ExitCode::SUCCESS
+                    } else {
+                        if let Some(error) = &result.error {
+                            eprintln!("error: {error}");
+                        }
+                        ExitCode::from(1)
+                    }
+                }
+                Err(error) => {
+                    eprintln!("error: {error}");
                     ExitCode::from(1)
                 }
             }
-            Err(error) => {
-                eprintln!("error: {error}");
-                ExitCode::from(1)
+        }
+        Ok(cli::Command::Address(request)) => {
+            match Anne::discover().and_then(|anne| anne.address(request)) {
+                Ok(result) => {
+                    if let Some(bundle_path) = &result.bundle_path {
+                        println!("Address bundle: {bundle_path}");
+                        println!("Comments selected: {}", result.comments_selected);
+                        println!("Specs generated: {}", result.specs_generated);
+                        println!("Specs failed: {}", result.specs_failed);
+                    }
+
+                    if result.success {
+                        ExitCode::SUCCESS
+                    } else {
+                        if let Some(error) = &result.error {
+                            eprintln!("error: {error}");
+                        }
+                        ExitCode::from(1)
+                    }
+                }
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    ExitCode::from(1)
+                }
             }
-        },
+        }
         Ok(cli::Command::Filter(request)) => match filter::run(request.target) {
             Ok(filter::RunResult::Comments {
                 bundle_path,
@@ -141,9 +211,12 @@ pub fn run_from_env() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use crate::cli::{
-        self, AddressRequest, Command, FilterRequest, FilterTarget, InvestigationRequest,
-        ReviewRequest,
+    use crate::{
+        address::AddressRequest,
+        cli::{self, Command, FilterRequest},
+        filter::FilterTarget,
+        investigate::InvestigationRequest,
+        review::ReviewRequest,
     };
 
     #[test]

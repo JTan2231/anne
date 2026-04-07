@@ -7,12 +7,17 @@ use std::{
 
 use crate::{
     agent,
-    cli::ReviewRequest,
     config::{AgentConfig, AppConfig, ReviewConfig},
     git::{self, ChangeRecord},
     json::JsonValue,
     util::{current_timestamp, slugify_text, string_array},
 };
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewRequest {
+    pub base: String,
+    pub head: String,
+}
 
 pub struct RunResult {
     pub bundle_path: Option<String>,
@@ -25,21 +30,37 @@ pub struct RunResult {
 }
 
 pub fn run(request: ReviewRequest) -> Result<RunResult, String> {
-    let prepared = prepare_run(&request)?;
+    let cwd = env::current_dir().map_err(|error| format!("failed to read current dir: {error}"))?;
+    let repo_root = git::repo_root(&cwd)?;
+    run_in(&repo_root, request)
+}
+
+pub fn run_in(repo_root: &Path, request: ReviewRequest) -> Result<RunResult, String> {
+    let config = AppConfig::load(repo_root)?;
+    run_with(repo_root, &config, request)
+}
+
+pub fn run_with(
+    repo_root: &Path,
+    config: &AppConfig,
+    request: ReviewRequest,
+) -> Result<RunResult, String> {
+    let prepared = prepare_run(repo_root, config, &request)?;
     Ok(run_materialized(request, prepared))
 }
 
-fn prepare_run(request: &ReviewRequest) -> Result<PreparedRun, String> {
-    let cwd = env::current_dir().map_err(|error| format!("failed to read current dir: {error}"))?;
-    let repo_root = git::repo_root(&cwd)?;
-    let config = AppConfig::load(&repo_root)?;
+fn prepare_run(
+    repo_root: &Path,
+    config: &AppConfig,
+    request: &ReviewRequest,
+) -> Result<PreparedRun, String> {
     let generated_at = current_timestamp();
     let review_id = build_review_id(&generated_at, &request.base, &request.head);
     let relative_bundle_path = PathBuf::from(".anne").join("reviews").join(&review_id);
     let bundle_root = repo_root.join(&relative_bundle_path);
     Ok(PreparedRun {
-        repo_root,
-        config,
+        repo_root: repo_root.to_path_buf(),
+        config: config.clone(),
         generated_at,
         review_id,
         relative_bundle_path,
