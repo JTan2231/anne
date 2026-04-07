@@ -2401,7 +2401,7 @@ fn run_executable_with_args_and_stdin(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let mut child = command.spawn().unwrap();
+    let mut child = spawn_with_text_file_busy_retry(&mut command);
     {
         let stdin = child.stdin.as_mut().unwrap();
         stdin.write_all(input.as_bytes()).unwrap();
@@ -2412,6 +2412,20 @@ fn run_executable_with_args_and_stdin(
 
 fn run_executable_with_stdin(executable: &Path, input: &str, path_env: Option<&str>) -> Output {
     run_executable_with_args_and_stdin(executable, &[], input, path_env)
+}
+
+fn spawn_with_text_file_busy_retry(command: &mut Command) -> Child {
+    for attempt in 0..20 {
+        match command.spawn() {
+            Ok(child) => return child,
+            Err(error) if error.raw_os_error() == Some(26) && attempt + 1 < 20 => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("failed spawning command: {error}"),
+        }
+    }
+
+    unreachable!("text-file-busy retry loop must return or panic")
 }
 
 fn wait_for(label: &str, predicate: impl Fn() -> bool) {

@@ -3,7 +3,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use git2::{Commit, Delta, DiffFindOptions, DiffFormat, DiffOptions, FileMode, Oid, Repository};
+use git2::{
+    Commit, Delta, DiffFindOptions, DiffFormat, DiffOptions, ErrorCode, FileMode, Oid, Repository,
+    StatusOptions,
+};
 
 #[derive(Debug, Clone)]
 pub struct ChangeRecord {
@@ -30,6 +33,14 @@ pub struct ReviewRange {
     pub changes: Vec<ChangeRecord>,
 }
 
+#[derive(Debug, Clone)]
+pub struct RepoContext {
+    pub repo_root: String,
+    pub head: Option<String>,
+    pub branch: Option<String>,
+    pub worktree_dirty: bool,
+}
+
 pub fn repo_root(cwd: &Path) -> Result<PathBuf, String> {
     let repo = Repository::discover(cwd).map_err(|error| {
         format!(
@@ -49,6 +60,42 @@ pub fn open_repo(repo_root: &Path) -> Result<Repository, String> {
             "failed opening repository at {}: {error}",
             repo_root.display()
         )
+    })
+}
+
+pub fn capture_repo_context(repo_root: &Path) -> Result<RepoContext, String> {
+    let repo = open_repo(repo_root)?;
+    let mut status_options = StatusOptions::new();
+    status_options
+        .include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .renames_head_to_index(true)
+        .renames_index_to_workdir(true);
+    let worktree_dirty = !repo
+        .statuses(Some(&mut status_options))
+        .map_err(|error| format!("failed reading worktree status: {error}"))?
+        .is_empty();
+
+    let head_ref = match repo.head() {
+        Ok(reference) => Some(reference),
+        Err(error) if matches!(error.code(), ErrorCode::UnbornBranch | ErrorCode::NotFound) => None,
+        Err(error) => return Err(format!("failed resolving repository HEAD: {error}")),
+    };
+    let head = head_ref
+        .as_ref()
+        .and_then(|reference| reference.target().map(|oid| oid.to_string()));
+    let branch = head_ref.as_ref().and_then(|reference| {
+        reference
+            .is_branch()
+            .then(|| reference.shorthand().map(ToString::to_string))
+            .flatten()
+    });
+
+    Ok(RepoContext {
+        repo_root: repo_root.display().to_string(),
+        head,
+        branch,
+        worktree_dirty,
     })
 }
 

@@ -9,6 +9,11 @@ pub struct AddressRequest {
     pub comment_id: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvestigationRequest {
+    pub prompt: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FilterTarget {
     Comments,
@@ -24,6 +29,7 @@ pub struct FilterRequest {
 pub enum Command {
     Help(String),
     Review(ReviewRequest),
+    Investigate(InvestigationRequest),
     Address(AddressRequest),
     Filter(FilterRequest),
 }
@@ -36,6 +42,7 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
     match args[0].as_str() {
         "-h" | "--help" | "help" => Ok(Command::Help(root_help())),
         "review" => parse_review(&args[1..]),
+        "investigate" => parse_investigate(&args[1..]),
         "address" => parse_address(&args[1..]),
         "filter" => parse_filter(&args[1..]),
         other => Err(format!("unknown command `{other}`\n\n{}", root_help())),
@@ -120,6 +127,28 @@ fn parse_review(args: &[String]) -> Result<Command, String> {
     }
 }
 
+fn parse_investigate(args: &[String]) -> Result<Command, String> {
+    if args.is_empty() {
+        return Ok(Command::Help(investigate_help()));
+    }
+
+    let mut prompt_words = Vec::new();
+    for arg in args {
+        match arg.as_str() {
+            "-h" | "--help" => return Ok(Command::Help(investigate_help())),
+            value if value.starts_with("--") => return Err(format!("unknown flag `{value}`")),
+            value => prompt_words.push(value.to_string()),
+        }
+    }
+
+    let prompt = prompt_words.join(" ");
+    if prompt.trim().is_empty() {
+        return Ok(Command::Help(investigate_help()));
+    }
+
+    Ok(Command::Investigate(InvestigationRequest { prompt }))
+}
+
 fn parse_address(args: &[String]) -> Result<Command, String> {
     if args.is_empty() {
         return Ok(Command::Address(AddressRequest { comment_id: None }));
@@ -164,14 +193,14 @@ fn parse_filter(args: &[String]) -> Result<Command, String> {
             "comments" => {
                 if target.replace(FilterTarget::Comments).is_some() {
                     return Err(
-                        "filter accepts at most one positional <comments|specs>".to_string(),
+                        "filter accepts at most one positional <comments|specs>".to_string()
                     );
                 }
             }
             "specs" => {
                 if target.replace(FilterTarget::Specs).is_some() {
                     return Err(
-                        "filter accepts at most one positional <comments|specs>".to_string(),
+                        "filter accepts at most one positional <comments|specs>".to_string()
                     );
                 }
             }
@@ -190,7 +219,7 @@ fn parse_filter(args: &[String]) -> Result<Command, String> {
 
 fn root_help() -> String {
     format!(
-        "{binary}\n\nCommands:\n  review    Review <base>...<head> using merge-base semantics\n  address   Generate feature specs from the latest persisted review findings\n  filter    Page through persisted review comments or generated address specs\n\nRun `{binary} review --help`, `{binary} address --help`, or `{binary} filter --help` for details.",
+        "{binary}\n\nCommands:\n  review       Review <base>...<head> using merge-base semantics\n  investigate  Investigate a repository issue from a freeform prompt\n  address      Generate feature specs from the latest persisted review findings\n  filter       Page through persisted review comments or generated address specs\n\nRun `{binary} review --help`, `{binary} investigate --help`, `{binary} address --help`, or `{binary} filter --help` for details.",
         binary = "anne"
     )
 }
@@ -209,6 +238,22 @@ Notes:
   - Triple-dot review is canonical user-facing syntax.
   - Anne resolves the merge base between `<base>` and `<head>` and reviews the diff from that merge base to `<head>`.
   - Two-dot range math is intentionally not accepted here."
+        .to_string()
+}
+
+fn investigate_help() -> String {
+    "\
+anne investigate
+
+Investigate a reported repository problem from a freeform prompt and write a local investigation bundle.
+
+Usage:
+  anne investigate <prompt>
+
+Notes:
+  - Multiple positional words are joined into one prompt with spaces.
+  - If no prompt is provided, Anne prints this help instead of starting a run.
+  - Investigation bundles are written under `.anne/investigations/`."
         .to_string()
 }
 

@@ -4,5 +4,8 @@
 .vizier/sessions/
 .vizier/jobs/
 .vizier/implementation-plans
-.vizier/state/
+.vizier/state/*
+!.vizier/state/plans/
+.vizier/state/plans/*
+!.vizier/state/plans/pln_79a7128e082c43e6a572a9dc659653a1.json
 .anne/

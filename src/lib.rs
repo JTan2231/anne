@@ -4,6 +4,7 @@ mod cli;
 mod config;
 mod filter;
 mod git;
+mod investigate;
 mod json;
 mod persisted_address;
 mod persisted_review;
@@ -29,6 +30,29 @@ pub fn run_from_env() -> ExitCode {
                         println!("Files failed: {}", result.files_failed);
                     }
                     println!("Findings: {}", result.findings);
+                }
+
+                if result.success {
+                    ExitCode::SUCCESS
+                } else {
+                    if let Some(error) = &result.error {
+                        eprintln!("error: {error}");
+                    }
+                    ExitCode::from(1)
+                }
+            }
+            Err(error) => {
+                eprintln!("error: {error}");
+                ExitCode::from(1)
+            }
+        },
+        Ok(cli::Command::Investigate(request)) => match investigate::run(request) {
+            Ok(result) => {
+                if let Some(bundle_path) = &result.bundle_path {
+                    println!("Investigation bundle: {bundle_path}");
+                    if result.success {
+                        println!("Report: report.md");
+                    }
                 }
 
                 if result.success {
@@ -117,7 +141,10 @@ pub fn run_from_env() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use crate::cli::{self, AddressRequest, Command, FilterRequest, FilterTarget, ReviewRequest};
+    use crate::cli::{
+        self, AddressRequest, Command, FilterRequest, FilterTarget, InvestigationRequest,
+        ReviewRequest,
+    };
 
     #[test]
     fn parses_explicit_review_refs() {
@@ -166,6 +193,43 @@ mod tests {
         .unwrap_err();
 
         assert!(error.contains("either --base/--head or <base>...<head>"));
+    }
+
+    #[test]
+    fn parses_investigate_multi_word_prompt() {
+        let command = cli::parse(&[
+            "investigate".to_string(),
+            "my".to_string(),
+            "requests".to_string(),
+            "keep".to_string(),
+            "hanging".to_string(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            command,
+            Command::Investigate(InvestigationRequest {
+                prompt: "my requests keep hanging".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn investigate_without_prompt_returns_help() {
+        let command = cli::parse(&["investigate".to_string()]).unwrap();
+
+        match command {
+            Command::Help(text) => assert!(text.contains("anne investigate")),
+            other => panic!("expected help, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_investigate_flag() {
+        let error =
+            cli::parse(&["investigate".to_string(), "--prompt-file".to_string()]).unwrap_err();
+
+        assert!(error.contains("unknown flag `--prompt-file`"));
     }
 
     #[test]
